@@ -1,8 +1,7 @@
 name: Publish to ESP Registry
 
-# This tells GitHub to run this script ONLY when you push a new version tag (e.g., v1.0.0)
 on:
-  workflow_dispatch:
+  workflow_dispatch: 
   push:
     tags:
       - 'v*.*.*'
@@ -12,11 +11,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
+
+      # Strips the 'v' from the tag (e.g. v1.0.1 -> 1.0.1)
+      - name: Get Version from Tag
+        id: get_version
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
 
       - name: Upload to ESP Component Registry
         uses: espressif/upload-components-ci-action@v2
         with:
-          namespace: "lugilugi" 
+          namespace: "lugilugi"
           components: "can_driver:."
-          api_token: ${{ secrets.IDF_COMPONENT_API_TOKEN }}
+          api_token: "${{ secrets.IDF_COMPONENT_API_TOKEN }}"
+          # Injects the cleaned version from the step above
+          version: "${{ steps.get_version.outputs.VERSION }}"
