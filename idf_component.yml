@@ -1,10 +1,9 @@
 
 description: "A non-blocking, pub/sub CAN (TWAI) driver using FreeRTOS queues."
-url: "https://github.com/YourGitHub/can_driver"
+url: "https://github.com/lugilugi/can_driver"
 examples:
   - path: examples/basic_test
 license: "MIT"
 dependencies:
   idf:
     version: ">=5.0"
-

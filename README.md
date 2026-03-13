@@ -36,15 +36,15 @@ dependencies:
 
 ### 1. Header Files
 
-- **CanDriver.h:** Contains the API and macros you'll use in your tasks.
-- **CanMessages.h:** The "Source of Truth" for CAN IDs and data packing. All nodes must use the same version.
+- **can_driver.h:** Contains the API and macros you'll use in your tasks.
+- **can_messages.h:** The "Source of Truth" for CAN IDs and data packing. All nodes must use the same version.
 
 ### 2. Initializing the Bus
 
 Call this once in your `app_main`. It handles hardware setup and spins up background monitoring tasks.
 
 ```c
-#include "CanDriver.h"
+#include "can_driver.h"
 
 void app_main() {
     // Parameters: TX GPIO, RX GPIO, Baud Rate

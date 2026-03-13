@@ -2,8 +2,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
-#include "CanDriver.h"   // Your custom driver
-#include "CanMessages.h" // Your custom message dictionary
+#include "can_driver.h"
+#include "can_messages.h"
 
 static const char *TAG = "VEC_TEST";
 
@@ -16,21 +16,21 @@ static const char *TAG = "VEC_TEST";
  */
 void motor_controller_task(void *arg) {
     // Zero-Boilerplate Subscription
-    QueueHandle_t pedal_q;
+    QueueHandle_t pedal_q; // create queue that will hold incoming messages for the pedal topic
     CAN_SUBSCRIBE_TOPIC(CAN_ID_PEDAL, &pedal_q, 10);
 
-    PedalPayload rx_data;
+    PedalPayload pedal_rx_data; // struct to hold the unpacked data from the CAN message
     
     ESP_LOGI(TAG, "Motor Controller Task Started.");
 
     while (1) {
         // Wait up to 200ms for a message. 
         // If it takes longer, the sender might be dead (Safety Check).
-        if (CAN_RECEIVE(pedal_q, &rx_data, 200)) {
+        if (CAN_RECEIVE(pedal_q, &pedal_rx_data, 200)) {
             
             // Extract values using our type-safe getters
-            float throttle = PedalPayload_getThrottle(&rx_data);
-            bool brake = PedalPayload_isBrakePressed(&rx_data);
+            float throttle = PedalPayload_getThrottle(&pedal_rx_data);
+            bool brake = PedalPayload_isBrakePressed(&pedal_rx_data);
             
             ESP_LOGI("MOTOR", "Commanding Motor: %.1f%% Throttle | Brake: %s", 
                      throttle, brake ? "ON" : "OFF");

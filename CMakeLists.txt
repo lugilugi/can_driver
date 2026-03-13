@@ -1,5 +1,5 @@
 idf_component_register(
-    SRCS "CanDriver.c"
+    SRCS "can_driver.c"
     INCLUDE_DIRS "include"
-    REQUIRES driver freertos
+    REQUIRES driver esp_driver_twai freertos log
 )
