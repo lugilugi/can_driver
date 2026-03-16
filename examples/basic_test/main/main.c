@@ -82,7 +82,7 @@ void example_2_publish(void) {
 
     // --- Energy: 40-bit accumulator value ---
     EnergyPayload energy = {0};
-    EnergyPayload_setRaw(&energy, 0x123456789AULL);
+    EnergyPayload_setRaw(&energy, 0x786);
     can_publish(CAN_ID_PWR_ENERGY, &energy, sizeof(energy));
 
     ESP_LOGI(TAG, "All messages published.");

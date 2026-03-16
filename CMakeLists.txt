@@ -1,5 +1,13 @@
 idf_component_register(
-    SRCS "can_driver.c"
-    INCLUDE_DIRS "include"
-    REQUIRES esp_driver_twai freertos log
+    SRCS
+        "can_state.c"
+        "can_driver.c"
+        "can_manager.c"
+        "can_selftest.c"
+    INCLUDE_DIRS
+        "include"
+    REQUIRES
+        esp_driver_twai
+        freertos
+        log
 )

@@ -1,167 +1,123 @@
-# can_driver
+## CAN Message Flow
 
-## ECT CAN Driver for ESP32
+### Sending a Message
+1. **Application** calls `can_driver_transmit(id, data, len)`.
+2. **Driver Layer**:
+   - Claims a slot from the static TX pool.
+   - Prepares the CAN frame and queues it for transmission.
+   - TWAI hardware transmits the frame.
+   - On TX completion, ISR marks the slot as free.
 
-This component abstracts the ESP32's TWAI peripheral into a robust Publisher/Subscriber model, ensuring telemetry tasks never interfere with critical motor control.
-
----
-
-## 🌟 Key Features
-
-- **Non-Blocking Architecture:** Uses FreeRTOS queues for background TX/RX. Your main code never hangs waiting for the CAN bus.
-- **Topic-Based Routing:** Multiple tasks can subscribe to the same CAN ID (fan-out).
-- **Automatic Fault Recovery:** Handles "Bus-Off" states and EMI-induced hardware hangs automatically.
-- **Efficient Bit-Packing:** Includes a dictionary for 40-bit energy accumulators (INA780/740) to save bus bandwidth.
-
----
-
-## 🛠 Installation
-
-Add this component to your ESP-IDF project via the registry:
-
-```bash
-idf.py component add lugilugi/can_driver
-```
-
-Or add it to your `idf_component.yml`:
-
-```yaml
-dependencies:
-    lugilugi/can_driver: "^1.0.0"
-```
+### Receiving a Message
+1. **TWAI hardware** receives a CAN frame.
+2. **Driver Layer**:
+   - ISR timestamps the frame and writes it to the static RX queue.
+   - Sets bus-off flag if an error occurs.
+3. **Manager Layer**:
+   - FreeRTOS manager task drains the RX queue.
+   - Decodes the payload and updates the relevant global state struct (e.g., `g_can_pedal`).
+   - Updates `last_rx_tick` for staleness checks.
 
 ---
 
-## 📖 API Reference
+## CAN Communication Subsystem
 
-### Header Files
-
-- **can_driver.h:** Main API and macros for CAN driver usage.
-- **can_payloads.h:** CAN message IDs and payload packing/unpacking helpers.
+This component provides a robust, statically-allocated CAN (TWAI) communication stack for the ESP32-C3. It follows a Producer-Consumer model where hardware events are decoupled from application logic to ensure timing stability in a vehicle environment.
 
 ---
 
-### Driver Lifecycle
+### 🏗️ Architecture Overview
 
-#### `esp_err_t can_driver_init(gpio_num_t tx_pin, gpio_num_t rx_pin, uint32_t baud, const uint32_t* filter_ids, size_t id_count);`
+The system is divided into three distinct layers to ensure that a failure in one does not compromise the entire stack:
 
-- Initializes the CAN driver and internal tasks.
-- Parameters:
-    - `tx_pin`: GPIO for CAN TX
-    - `rx_pin`: GPIO for CAN RX
-    - `baud`: CAN bus baud rate (e.g., 500000)
-    - `filter_ids`: Optional array of CAN IDs to filter (NULL for all)
-    - `id_count`: Number of IDs in filter_ids
-- Returns `ESP_OK` on success.
-
-#### `esp_err_t can_driver_deinit(void);`
-
-- Stops the node, deletes tasks, and frees memory.
-- Safe to call before re-initializing.
+- **Driver Layer (`can_driver`)**: Hardware Abstraction Layer (HAL). Manages the TWAI peripheral, static TX pool, and high-priority ISRs.
+- **Manager Layer (`can_manager`)**: The "Glue" layer. Dedicated FreeRTOS task drains the RX queue, handles bus-off recovery, and dispatches data to the state layer.
+- **State Layer (`can_state`)**: The "Global Mailbox." Stores the latest decoded telemetry. This is the only layer the main application should interact with.
 
 ---
 
-### Data Access & Interaction
+### 🛠️ API Reference
 
-#### `esp_err_t can_publish(uint32_t id, const void* payload, uint8_t len);`
+#### 1. Driver Layer (`can_driver.h`)
+Payload-agnostic hardware control.
 
-- Non-blocking publish to the CAN bus.
-- Enforces Classic CAN constraints (max 8 bytes, no FD).
-- Returns `ESP_OK` if queued, `ESP_FAIL` otherwise.
+| Function                | Description |
+|------------------------|-------------|
+| `can_driver_init(flags)`      | Configures GPIOs, baud rate, hardware filters. Initializes static TX pool and RX queue. |
+| `can_driver_deinit()`         | Disables TWAI node and frees hardware resources. |
+| `can_driver_transmit(id, data, len)` | Thread-safe. Claims a slot from the static pool and queues a frame for transmission. Non-blocking. |
+| `can_driver_receive(evt, timeout)`    | Internal-use only (Manager). Blocks until a frame arrives in the RX queue. |
+| `can_driver_recover()`         | Triggers TWAI bus-off recovery sequence. Must be called from task context. |
+| `can_driver_is_bus_off()`      | Returns true if hardware has entered bus-off state due to electrical errors. |
 
-#### `void can_get_state_internal(size_t offset, void* dest, size_t size);`
+#### 2. Manager Layer (`can_manager.h`)
+Lifecycle management for the background dispatcher.
 
-- Internal backend for the `CAN_GET_STATE` macro.
-- Copies the latest received data for a field from the global vehicle database.
+| Function                | Description |
+|------------------------|-------------|
+| `can_manager_init()`         | Spawns the manager task with static stack allocation. Must be called after the driver is up. |
+| `can_manager_deinit()`       | Signals the manager task to stop and deletes the task handle. |
 
-#### `#define CAN_GET_STATE(field, dest_ptr)`
+#### 3. State Layer (`can_state.h`)
+Data access for the vehicle application.
 
-- Macro for type-safe state retrieval.
-- Example: `CAN_GET_STATE(pedal, &my_pedal)`
+This layer exposes Global State Structs (e.g., `g_can_pedal`, `g_can_energy`).
 
-#### `void can_set_rx_hook(can_rx_hook_t hook);`
-
-- Registers a callback for raw frame monitoring (e.g., SD logging).
-- Runs in ISR context; must not block.
-
-#### `bool can_is_stale(HBIndex_t index, uint32_t timeout_ms);`
-
-- Checks if a specific node's data is older than the specified timeout.
-- Returns true if stale.
+| Global Instance   | Source ID | Contained Data |
+|-------------------|-----------|---------------|
+| `g_can_pedal`     | 0x110     | Throttle (%), Brake (bool), last_rx_tick |
+| `g_can_aux`       | 0x210     | Lights, wipers, horn bitfields |
+| `g_can_pwr780`    | 0x310     | Traction battery Voltage and Current |
+| `g_can_energy`    | 0x312     | 64-bit Accumulated Joules (critical section required for reads) |
 
 ---
 
-### Data Structures
+### ⚠️ Vital Safety Protocols
 
-#### `VehicleDB_t`
+#### Staleness Checks
+Every state struct includes a `last_rx_tick`. The application must verify data freshness before taking action.
 
 ```c
-typedef struct {
-        PedalPayload      pedal;      // Latest throttle/brake state
-        AuxControlPayload aux;        // Latest lights/accessories state
-        PowerPayload      pwr_780;    // High-current traction system data
-        PowerPayload      pwr_740;    // Low-current auxiliary system data
-        EnergyPayload     energy;     // 40-bit energy accumulator data
-        uint32_t          last_seen[HB_MAX]; // Tick counts of last received messages
-} VehicleDB_t;
+// Example: Safety interlock in the Motor Task
+TickType_t age = xTaskGetTickCount() - g_can_pedal.last_rx_tick;
+if (age > pdMS_TO_TICKS(50)) {
+    emergency_stop_motor(); // Pedal node has gone silent
+}
 ```
 
-#### `HBIndex_t`
-
-Heartbeat tracking indices for node health:
+#### Thread Safety (64-bit Data)
+The ESP32-C3 is a 32-bit architecture. Accessing `g_can_energy.joules_780` is not atomic. Always wrap reads in a critical section to prevent "torn reads":
 
 ```c
-typedef enum {
-        HB_PEDAL = 0,
-        HB_AUX,
-        HB_PWR_780,
-        HB_PWR_740,
-        HB_ENERGY,
-        HB_MAX
-} HBIndex_t;
+// Thread-safe read of energy
+portENTER_CRITICAL(&s_energy_mux); // Note: Requires exposing the mux or using a getter
+current_joules = g_can_energy.joules_780;
+portEXIT_CRITICAL(&s_energy_mux);
 ```
 
-#### `can_rx_hook_t`
-
-Callback type for frame monitoring:
-
-```c
-typedef void (*can_rx_hook_t)(const twai_frame_t* frame);
-```
+#### Bus-Off Recovery
+The manager task handles recovery automatically. If `can_driver_is_bus_off()` is true, the manager will initiate recovery, which requires 129 occurrences of 11 consecutive recessive bits on the bus to complete.
 
 ---
 
-### Payload Packing Helpers
+### 🧪 Self-Test
 
-See `can_payloads.h` for detailed packing/unpacking functions:
-
-- **PedalPayload**
-    - `PedalPayload_set(PedalPayload* p, float throttlePercent, bool brakePressed)`
-    - `float PedalPayload_getThrottle(const PedalPayload* p)`
-    - `bool PedalPayload_isBrakePressed(const PedalPayload* p)`
-
-- **AuxControlPayload**
-    - Bitfields for lights, wipers, horn, etc.
-
-- **PowerPayload**
-    - `PowerPayload_setRaw(PowerPayload* p, uint16_t raw_volts, int16_t raw_amps)`
-    - `float PowerPayload_getVoltage(const PowerPayload* p)`
-    - `float PowerPayload_getCurrent_780(const PowerPayload* p)`
-    - `float PowerPayload_getCurrent_740(const PowerPayload* p)`
-
-- **EnergyPayload**
-    - `EnergyPayload_setRaw(EnergyPayload* p, uint64_t raw_energy_reg)`
-    - `double EnergyPayload_getJoules_780(const EnergyPayload* p)`
-    - `double EnergyPayload_getJoules_740(const EnergyPayload* p)`
+A built-in self-test (`can_selftest`) uses TWAI loopback and self-test mode to verify every layer without external hardware. See [include/can_selftest.h](include/can_selftest.h) and [examples/selftest/](examples/selftest/) for details.
 
 ---
 
-## 🧑‍💻 Example Application
+### 📁 Folder Structure
 
-See `examples/basic_test/main/main.c` for a complete working demo with simulated pedal and motor controller tasks. Each function demonstrates a feature of the API.
+- `can_driver.c/h` — Hardware abstraction
+- `can_manager.c/h` — RX dispatch and state update
+- `can_state.c/h` — Global state structs
+- `can_selftest.c/h` — Self-test routines
+- `include/` — Public headers
+- `examples/` — Example applications
 
 ---
 
-## 📚 License & Contributions
-
-Open to contributions! Please submit issues or pull requests for improvements.
+### 📚 Further Reading
+- See header files in [include/](include/) for detailed API documentation.
+- Example usage in [examples/basic_test/main/](examples/basic_test/main/).
+- Self-test implementation in [examples/selftest/](examples/selftest/).

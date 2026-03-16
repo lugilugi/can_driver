@@ -1,5 +1,5 @@
 idf_component_register(
-    SRCS "can_example.c"
+    SRCS "selftestmain.c"
     INCLUDE_DIRS "."
     REQUIRES can_driver driver
 )

@@ -1,211 +1,370 @@
 #include "can_driver.h"
+#include "can_config.h"
+#include "esp_twai.h"
+#include "esp_twai_onchip.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include <string.h>
 
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-#include "freertos/queue.h"
+static const char *TAG = "can_driver";
 
-static const char* TAG = "CAN_DRV";
+// =============================================================================
+// TWAI node handle
+// =============================================================================
+static twai_node_handle_t s_node_hdl = NULL;
 
-// Notification bits for precise state machine transitions
-#define NOTIFY_BUS_OFF      (1 << 0)
-#define NOTIFY_BUS_ACTIVE   (1 << 1)
-
-// Wrapper to ensure deep copy of data in the Tx queue
+// =============================================================================
+// Static TX pool
+//
+// Each slot bundles a twai_frame_t with the data buffer it points to.
+// The TWAI API holds a pointer to twai_frame_t::buffer until on_tx_done fires,
+// so the buffer MUST outlive the call to twai_node_transmit(). Keeping frame
+// and buffer colocated in one struct makes this trivially safe — the pointer
+// never outlives the slot.
+//
+// Slot lifecycle:  IDLE -> (claimed) -> IN_FLIGHT -> (on_tx_done ISR) -> IDLE
+// =============================================================================
 typedef struct {
-    twai_frame_t frame;
-    uint8_t data[8]; 
-} CanTxItem_t;
+    twai_frame_t  frame;
+    uint8_t       data[8];
+    volatile bool in_use;
+} CanTxSlot_t;
 
-// Routing Map
-typedef struct { uint32_t can_id; size_t offset; uint8_t len; HBIndex_t hb; } CanRoute_t;
-static const CanRoute_t ROUTE_TABLE[] = {
-    { CAN_ID_PEDAL, offsetof(VehicleDB_t, pedal), sizeof(PedalPayload), HB_PEDAL },
-    { CAN_ID_AUX_CTRL, offsetof(VehicleDB_t, aux), sizeof(AuxControlPayload), HB_AUX },
-    { CAN_ID_PWR_MONITOR_780, offsetof(VehicleDB_t, pwr_780), sizeof(PowerPayload), HB_PWR_780 },
-    { CAN_ID_PWR_MONITOR_740, offsetof(VehicleDB_t, pwr_740), sizeof(PowerPayload), HB_PWR_740 },
-    { CAN_ID_PWR_ENERGY, offsetof(VehicleDB_t, energy), 5, HB_ENERGY }
-};
-#define ROUTE_COUNT (sizeof(ROUTE_TABLE) / sizeof(CanRoute_t))
+static DRAM_ATTR CanTxSlot_t s_tx_pool[CAN_TX_POOL_SIZE];
+static portMUX_TYPE          s_tx_pool_mux = portMUX_INITIALIZER_UNLOCKED;
 
-static VehicleDB_t v_db = {0};
-static portMUX_TYPE db_mux = portMUX_INITIALIZER_UNLOCKED;
-static can_rx_hook_t app_hook = NULL;
+// =============================================================================
+// Static RX queue — ISR writes, manager task reads.
+// DRAM_ATTR ensures the backing storage is accessible when the flash cache is
+// disabled (e.g. during NVS writes or OTA).
+// =============================================================================
+static DRAM_ATTR StaticQueue_t s_rx_queue_struct;
+static DRAM_ATTR uint8_t       s_rx_queue_storage[CAN_RX_QUEUE_DEPTH * sizeof(CanRxEvent_t)];
+static QueueHandle_t           s_rx_queue = NULL;
 
-static twai_node_handle_t node_hdl = NULL;
-static QueueHandle_t tx_queue = NULL;
-static TaskHandle_t tx_task_handle = NULL;
-static TaskHandle_t recovery_task_handle = NULL;
-static bool is_running = false;
+// =============================================================================
+// Bus-off flag — set by ISR, polled and cleared by the manager task.
+// =============================================================================
+static volatile bool s_bus_off_pending = false;
 
-esp_err_t can_driver_deinit(void) {
-    if (!is_running && !node_hdl && !tx_queue) return ESP_OK;
+// =============================================================================
+// ISR diagnostic counters
+// Incremented in on_rx_done to distinguish two failure modes:
+//   s_isr_rx_calls == 0  →  on_rx_done is never invoked (filter / driver issue)
+//   s_isr_rx_fail  > 0  →  callback fires but twai_node_receive_from_isr fails
+// Reset and read via can_driver_reset_isr_counters() / can_driver_get_isr_rx_*()
+// =============================================================================
+static volatile uint32_t s_isr_rx_calls = 0;
+static volatile uint32_t s_isr_rx_fail  = 0;
 
-    if (node_hdl) {
-        esp_err_t ret = twai_node_disable(node_hdl); //
-        if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
-            ESP_LOGW(TAG, "Node disable failed: %s", esp_err_to_name(ret));
+// =============================================================================
+// TX pool helpers
+// =============================================================================
+
+static CanTxSlot_t *tx_pool_claim(void)
+{
+    CanTxSlot_t *slot = NULL;
+    portENTER_CRITICAL(&s_tx_pool_mux);
+    for (int i = 0; i < CAN_TX_POOL_SIZE; i++) {
+        if (!s_tx_pool[i].in_use) {
+            s_tx_pool[i].in_use = true;
+            slot = &s_tx_pool[i];
+            break;
         }
     }
-
-    if (tx_task_handle) vTaskDelete(tx_task_handle);
-    if (recovery_task_handle) vTaskDelete(recovery_task_handle);
-    if (node_hdl) twai_node_delete(node_hdl); //
-    if (tx_queue) vQueueDelete(tx_queue);
-
-    tx_task_handle = NULL;
-    recovery_task_handle = NULL;
-    node_hdl = NULL;
-    tx_queue = NULL;
-    is_running = false;
-    return ESP_OK;
+    portEXIT_CRITICAL(&s_tx_pool_mux);
+    return slot;
 }
 
-// ===================================================================================
-// INTERNAL HELPERS
-// ===================================================================================
-
-static void configure_hardware_filter(const uint32_t* ids, size_t count) {
-    if (count == 0) return;
-    uint32_t c_ones = ids[0], c_zeros = ~ids[0] & 0x7FF;
-    for (size_t i = 1; i < count; i++) {
-        c_ones &= ids[i];
-        c_zeros &= (~ids[i] & 0x7FF);
-    }
-    // ESP-IDF v5.5.3 Logic: 1 = match exactly, 0 = ignore
-    uint32_t match_mask = (c_ones | c_zeros) & 0x7FF;
-    twai_mask_filter_config_t cfg = { .id = c_ones, .mask = match_mask, .is_ext = false };
-    ESP_ERROR_CHECK(twai_node_config_mask_filter(node_hdl, 0, &cfg)); // Must be called while disabled
+// Release from task context (error path in can_driver_transmit).
+static void tx_pool_release(CanTxSlot_t *slot)
+{
+    portENTER_CRITICAL(&s_tx_pool_mux);
+    slot->in_use = false;
+    portEXIT_CRITICAL(&s_tx_pool_mux);
 }
 
-// ===================================================================================
-// ISR CALLBACKS
-// ===================================================================================
-
-static bool twai_rx_cb(twai_node_handle_t handle, const twai_rx_done_event_data_t *edata, void *ctx) {
-    twai_frame_t rx;
-    uint8_t buf[8];
-    rx.buffer = buf;
-    rx.buffer_len = 8;
-
-    if (twai_node_receive_from_isr(handle, &rx) == ESP_OK) {
-        if (rx.header.fdf) return false; // Incompatible FD frames are treated as errors
-        if (app_hook) app_hook(&rx);
-
-        for (int i = 0; i < ROUTE_COUNT; i++) {
-            if (rx.header.id == ROUTE_TABLE[i].can_id) {
-                taskENTER_CRITICAL_ISR(&db_mux);
-                memcpy((uint8_t*)&v_db + ROUTE_TABLE[i].offset, rx.buffer, ROUTE_TABLE[i].len);
-                v_db.last_seen[ROUTE_TABLE[i].hb] = xTaskGetTickCountFromISR();
-                taskEXIT_CRITICAL_ISR(&db_mux);
-                break;
-            }
+// Release from ISR context — matches slot by frame pointer address.
+static void IRAM_ATTR tx_pool_release_isr(const twai_frame_t *done_frame)
+{
+    portENTER_CRITICAL_ISR(&s_tx_pool_mux);
+    for (int i = 0; i < CAN_TX_POOL_SIZE; i++) {
+        if (&s_tx_pool[i].frame == done_frame) {
+            s_tx_pool[i].in_use = false;
+            break;
         }
+    }
+    portEXIT_CRITICAL_ISR(&s_tx_pool_mux);
+}
+
+// =============================================================================
+// ISR callbacks
+// IRAM_ATTR keeps them reachable when the flash cache is disabled.
+// Return value: true = yield to higher-priority task on ISR exit.
+// =============================================================================
+
+static bool IRAM_ATTR on_tx_done(twai_node_handle_t handle,
+                                  const twai_tx_done_event_data_t *edata,
+                                  void *user_ctx)
+{
+    tx_pool_release_isr(edata->done_tx_frame);
+    return false;
+}
+
+static bool IRAM_ATTR on_rx_done(twai_node_handle_t handle,
+                                  const twai_rx_done_event_data_t *edata,
+                                  void *user_ctx)
+{
+    // Count every invocation — if this stays 0 after TX in loopback mode,
+    // the filter is rejecting frames before the callback is ever called.
+    s_isr_rx_calls++;
+
+    // Capture the tick immediately — most accurate bus arrival timestamp.
+    TickType_t rx_tick = xTaskGetTickCountFromISR();
+
+    uint8_t      recv_buf[8] = {0};
+    twai_frame_t rx_frame    = {
+        .buffer     = recv_buf,
+        .buffer_len = sizeof(recv_buf),
+    };
+
+    if (twai_node_receive_from_isr(handle, &rx_frame) != ESP_OK) {
+        s_isr_rx_fail++;
+        return false;
+    }
+
+    CanRxEvent_t evt = {
+        .id      = rx_frame.header.id,
+        .len     = (rx_frame.header.dlc <= 8) ? (uint8_t)rx_frame.header.dlc : 8,
+        .rx_tick = rx_tick,
+    };
+    memcpy(evt.data, recv_buf, evt.len);
+
+    BaseType_t higher_prio_woken = pdFALSE;
+    xQueueSendFromISR(s_rx_queue, &evt, &higher_prio_woken);
+    return (higher_prio_woken == pdTRUE);
+}
+
+static bool IRAM_ATTR on_state_change(twai_node_handle_t handle,
+                                       const twai_state_change_event_data_t *edata,
+                                       void *user_ctx)
+{
+    if (edata->new_sta == TWAI_ERROR_BUS_OFF) {
+        // Signal the manager task — twai_node_recover() must not be called
+        // from ISR context.
+        s_bus_off_pending = true;
     }
     return false;
 }
 
-static bool twai_state_cb(twai_node_handle_t handle, const twai_state_change_event_data_t *edata, void *ctx) {
-    BaseType_t woken = pdFALSE;
-    if (recovery_task_handle == NULL) return false;
-
-    if (edata->new_sta == TWAI_ERROR_BUS_OFF) {
-        xTaskNotifyFromISR(recovery_task_handle, NOTIFY_BUS_OFF, eSetBits, &woken);
-    } else if (edata->new_sta == TWAI_ERROR_ACTIVE) {
-        xTaskNotifyFromISR(recovery_task_handle, NOTIFY_BUS_ACTIVE, eSetBits, &woken);
-    }
-    return woken == pdTRUE;
+static bool IRAM_ATTR on_error(twai_node_handle_t handle,
+                                const twai_error_event_data_t *edata,
+                                void *user_ctx)
+{
+    // Kept minimal — ISR callbacks should do as little as possible.
+    // The manager can call twai_node_get_info() if detailed diagnostics are
+    // needed from task context.
+    return false;
 }
 
-// ===================================================================================
-// TASKS
-// ===================================================================================
+// =============================================================================
+// Public API
+// =============================================================================
 
-static void recovery_task(void *arg) {
-    uint32_t delay = 100, bits;
-    while (1) {
-        // Wait specifically for BUS_OFF bit and clear on exit
-        xTaskNotifyWait(0, NOTIFY_BUS_OFF | NOTIFY_BUS_ACTIVE, &bits, portMAX_DELAY);
-        if (!(bits & NOTIFY_BUS_OFF)) continue; // Spurious wakeup, ignore
-
-        ESP_LOGE(TAG, "Bus-Off! Suspending TX and waiting %lu ms", delay);
-        vTaskSuspend(tx_task_handle);
-        vTaskDelay(pdMS_TO_TICKS(delay));
-        xQueueReset(tx_queue);
-        
-        // Non-blocking recovery initiation
-        if (twai_node_recover(node_hdl) == ESP_OK) {
-            // Wait for BUS_ACTIVE bit to ensure hardware is back online
-            TickType_t timeout = pdMS_TO_TICKS(5000);
-            if (xTaskNotifyWait(0, NOTIFY_BUS_ACTIVE, &bits, timeout) == pdFALSE || 
-                !(bits & NOTIFY_BUS_ACTIVE)) {
-                ESP_LOGE(TAG, "Recovery timed out. Bus may be physically damaged.");
-                delay = (delay * 2 > 5000) ? 5000 : delay * 2;
-                xTaskNotify(xTaskGetCurrentTaskHandle(), NOTIFY_BUS_OFF, eSetBits);
-                continue;
-            }
-            ESP_LOGI(TAG, "Bus Recovered. Resuming TX.");
-            vTaskResume(tx_task_handle);
-            delay = 100; // Reset backoff on success
-        } else {
-            delay = (delay * 2 > 5000) ? 5000 : delay * 2;
-            // Retry recovery on next loop by setting BUS_OFF bit
-            xTaskNotify(xTaskGetCurrentTaskHandle(), NOTIFY_BUS_OFF, eSetBits); 
-        }
+esp_err_t can_driver_init(CanInitFlags_t flags)
+{
+    if (s_node_hdl != NULL) {
+        ESP_LOGE(TAG, "Already initialized — call can_driver_deinit() first");
+        return ESP_ERR_INVALID_STATE;
     }
-}
 
-static void tx_task(void* arg) {
-    CanTxItem_t item;
-    while(xQueueReceive(tx_queue, &item, portMAX_DELAY)) {
-        item.frame.buffer = item.data; 
-        twai_node_transmit(node_hdl, &item.frame, pdMS_TO_TICKS(10));
+    // Validate flag combinations before touching hardware.
+    if (flags.loopback && flags.listen_only) {
+        ESP_LOGE(TAG, "loopback and listen_only are mutually exclusive");
+        return ESP_ERR_INVALID_ARG;
     }
-}
 
-// ===================================================================================
-// PUBLIC API
-// ===================================================================================
+    // Loopback without self_test causes TX failures when no other node is
+    // present to supply the ACK. Enforce the pairing silently.
+    if (flags.loopback) {
+        flags.self_test = 1;
+    }
 
-esp_err_t can_driver_init(gpio_num_t tx, gpio_num_t rx, uint32_t baud, const uint32_t* f_ids, size_t f_count) {
-    if (is_running) return ESP_OK;
+    s_rx_queue = xQueueCreateStatic(
+        CAN_RX_QUEUE_DEPTH,
+        sizeof(CanRxEvent_t),
+        s_rx_queue_storage,
+        &s_rx_queue_struct
+    );
+    if (s_rx_queue == NULL) {
+        ESP_LOGE(TAG, "Failed to create static RX queue");
+        return ESP_FAIL;
+    }
 
-    tx_queue = xQueueCreate(20, sizeof(CanTxItem_t));
-    if (!tx_queue) return ESP_ERR_NO_MEM;
+    // Explicit zero — makes re-init after deinit safe in addition to BSS zero.
+    memset(s_tx_pool, 0, sizeof(s_tx_pool));
+    s_bus_off_pending = false;
+    s_isr_rx_calls    = 0;
+    s_isr_rx_fail     = 0;
 
-    twai_onchip_node_config_t n_cfg = { .io_cfg.tx=tx, .io_cfg.rx=rx, .bit_timing.bitrate=baud, .tx_queue_depth=20 };
-    if (twai_new_node_onchip(&n_cfg, &node_hdl) != ESP_OK) return ESP_FAIL;
+    twai_onchip_node_config_t node_cfg = {
+        .io_cfg.tx                = CAN_TX_GPIO,
+        .io_cfg.rx                = CAN_RX_GPIO,
+        .bit_timing.bitrate       = CAN_BAUD_RATE,
+        .tx_queue_depth           = CAN_TX_QUEUE_DEPTH,
+        .fail_retry_cnt           = CAN_TX_RETRY_COUNT,
+        .flags.enable_self_test   = (uint8_t)flags.self_test,
+        .flags.enable_loopback    = (uint8_t)flags.loopback,
+        .flags.enable_listen_only = (uint8_t)flags.listen_only,
+        .flags.no_receive_rtr     = (uint8_t)flags.no_rtr,
+    };
 
-    twai_event_callbacks_t cbs = { .on_rx_done = twai_rx_cb, .on_state_change = twai_state_cb };
-    twai_node_register_event_callbacks(node_hdl, &cbs, NULL); // Registered before enable
-    configure_hardware_filter(f_ids, f_count);
+    esp_err_t ret = twai_new_node_onchip(&node_cfg, &s_node_hdl);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "twai_new_node_onchip failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
 
-    // FIX: Handles are assigned BEFORE enable to ensure callbacks don't crash on initial state change
-    if (xTaskCreate(tx_task, "CAN_Tx", 4096, NULL, 9, &tx_task_handle) != pdPASS ||
-        xTaskCreate(recovery_task, "CAN_Rec", 2048, NULL, 11, &recovery_task_handle) != pdPASS) return ESP_FAIL;
+    twai_event_callbacks_t cbs = {
+        .on_rx_done      = on_rx_done,
+        .on_tx_done      = on_tx_done,
+        .on_state_change = on_state_change,
+        .on_error        = on_error,
+    };
+    ret = twai_node_register_event_callbacks(s_node_hdl, &cbs, NULL);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "twai_node_register_event_callbacks failed: %s", esp_err_to_name(ret));
+        goto cleanup;
+    }
 
-    if (twai_node_enable(node_hdl) != ESP_OK) return ESP_FAIL;
+    // Configure accept-all filter BEFORE enable — the hardware requires the
+    // node to be stopped when writing filter registers.
+    // id=0, mask=0 → every bit is don't-care → every standard frame passes.
+    twai_mask_filter_config_t accept_all = {
+        .id     = 0,
+        .mask   = 0,
+        .is_ext = false,
+    };
+    ret = twai_node_config_mask_filter(s_node_hdl, 0, &accept_all);
+    ESP_LOGI(TAG, "Filter config: %s", esp_err_to_name(ret));
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "twai_node_config_mask_filter failed: %s", esp_err_to_name(ret));
+        goto cleanup;
+    }
 
-    is_running = true;
+    ret = twai_node_enable(s_node_hdl);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "twai_node_enable failed: %s", esp_err_to_name(ret));
+        goto cleanup;
+    }
+
+    ESP_LOGI(TAG, "Initialized at %d bps [loopback=%d self_test=%d listen_only=%d no_rtr=%d] (TX=%d RX=%d)",
+             CAN_BAUD_RATE,
+             flags.loopback, flags.self_test, flags.listen_only, flags.no_rtr,
+             CAN_TX_GPIO, CAN_RX_GPIO);
     return ESP_OK;
+
+cleanup:
+    twai_node_delete(s_node_hdl);
+    s_node_hdl = NULL;
+    return ret;
 }
 
-void can_set_rx_hook(can_rx_hook_t hook) { app_hook = hook; }
-
-void can_get_state_internal(size_t off, void* dst, size_t sz) {
-    taskENTER_CRITICAL(&db_mux);
-    memcpy(dst, (uint8_t*)&v_db + off, sz);
-    taskEXIT_CRITICAL(&db_mux);
+esp_err_t can_driver_deinit(void)
+{
+    if (s_node_hdl == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    twai_node_disable(s_node_hdl);
+    esp_err_t ret = twai_node_delete(s_node_hdl);
+    s_node_hdl = NULL;
+    ESP_LOGI(TAG, "Deinitialized");
+    return ret;
 }
 
-bool can_is_stale(HBIndex_t idx, uint32_t ms) {
-    return (xTaskGetTickCount() - v_db.last_seen[idx]) > pdMS_TO_TICKS(ms);
+esp_err_t can_driver_transmit(uint32_t id, const uint8_t *data, uint8_t len)
+{
+    if (s_node_hdl == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (len > 8) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    CanTxSlot_t *slot = tx_pool_claim();
+    if (slot == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    memcpy(slot->data, data, len);
+    slot->frame = (twai_frame_t){
+        .header.id  = id,
+        .header.ide = false,    // 11-bit standard ID
+        .buffer     = slot->data,
+        .buffer_len = len,
+    };
+
+    // timeout=0: non-blocking. If the hardware TX queue is full the frame is
+    // dropped and the slot is released immediately.
+    esp_err_t ret = twai_node_transmit(s_node_hdl, &slot->frame, 0);
+    if (ret != ESP_OK) {
+        tx_pool_release(slot);
+        ESP_LOGW(TAG, "twai_node_transmit failed (id=0x%03lX): %s",
+                 (unsigned long)id, esp_err_to_name(ret));
+    }
+    return ret;
 }
 
-esp_err_t can_publish(uint32_t id, const void* pld, uint8_t len) {
-    if (len > 8 || !tx_queue) return ESP_ERR_INVALID_ARG;
-    CanTxItem_t item = { .frame = { .header.id = id, .header.fdf = false, .buffer_len = len } };
-    memcpy(item.data, pld, len); 
-    return xQueueSend(tx_queue, &item, 0) == pdTRUE ? ESP_OK : ESP_FAIL;
+esp_err_t can_driver_receive(CanRxEvent_t *evt, TickType_t timeout_ticks)
+{
+    if (xQueueReceive(s_rx_queue, evt, timeout_ticks) == pdTRUE) {
+        return ESP_OK;
+    }
+    return ESP_ERR_TIMEOUT;
+}
+
+int can_driver_get_pool_used(void)
+{
+    int count = 0;
+    portENTER_CRITICAL(&s_tx_pool_mux);
+    for (int i = 0; i < CAN_TX_POOL_SIZE; i++) {
+        if (s_tx_pool[i].in_use) count++;
+    }
+    portEXIT_CRITICAL(&s_tx_pool_mux);
+    return count;
+}
+
+bool can_driver_is_bus_off(void)
+{
+    return s_bus_off_pending;
+}
+
+void can_driver_clear_bus_off(void)
+{
+    s_bus_off_pending = false;
+}
+
+esp_err_t can_driver_recover(void)
+{
+    if (s_node_hdl == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    return twai_node_recover(s_node_hdl);
+}
+
+uint32_t can_driver_get_isr_rx_calls(void)
+{
+    return s_isr_rx_calls;
+}
+
+uint32_t can_driver_get_isr_rx_fail(void)
+{
+    return s_isr_rx_fail;
+}
+
+void can_driver_reset_isr_counters(void)
+{
+    s_isr_rx_calls = 0;
+    s_isr_rx_fail  = 0;
 }
