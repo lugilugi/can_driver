@@ -4,6 +4,7 @@ idf_component_register(
         "can_driver.c"
         "can_manager.c"
         "can_selftest.c"
+        "can_logger.c"
     INCLUDE_DIRS
         "include"
     REQUIRES
@@ -11,4 +12,7 @@ idf_component_register(
         freertos
         log
         driver
+        esp_driver_sdmmc
+        esp_driver_sdspi
+        fatfs
 )

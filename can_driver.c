@@ -6,6 +6,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include <string.h>
+#include <stdlib.h>
 
 static const char *TAG = "can_driver";
 
@@ -367,4 +368,239 @@ void can_driver_reset_isr_counters(void)
 {
     s_isr_rx_calls = 0;
     s_isr_rx_fail  = 0;
+}
+
+// =============================================================================
+// Filter helpers (internal)
+// =============================================================================
+
+// Bit-width of the ID field for the selected frame format.
+// Standard: 11 bits → full_mask = 0x7FF
+// Extended: 29 bits → full_mask = 0x1FFFFFFF
+static inline uint32_t filter_full_mask(bool is_ext)
+{
+    return is_ext ? 0x1FFFFFFFU : 0x7FFU;
+}
+
+// Compute the tightest single mask filter that accepts every ID in [ids, count).
+//
+// For each bit position b:
+//   • If every ID has bit b == 1  →  agree, filter ID bit = 1, mask bit = 1
+//   • If every ID has bit b == 0  →  agree, filter ID bit = 0, mask bit = 1
+//   • Mixed                       →  don't-care,              mask bit = 0
+//
+// Returns the number of spurious IDs accepted beyond the supplied list.
+// A spurious count of 0 means the filter is a perfect whitelist.
+static uint32_t filter_compute_group(const uint32_t *ids, size_t count,
+                                     bool is_ext,
+                                     uint32_t *out_id, uint32_t *out_mask)
+{
+    const uint32_t full = filter_full_mask(is_ext);
+
+    if (count == 0) {
+        // Reject-all: id = full, mask = full.
+        // No ID can satisfy (incoming & full) == full for a randomly chosen
+        // full-bit pattern, so this effectively blocks everything.
+        *out_id   = full;
+        *out_mask = full;
+        return 0;
+    }
+
+    // all_ones: bits that are 1 in EVERY ID  →  agreed-1 positions
+    // any_ones: bits that are 1 in AT LEAST one ID
+    uint32_t all_ones = full;
+    uint32_t any_ones = 0;
+    for (size_t i = 0; i < count; i++) {
+        all_ones &= ids[i];
+        any_ones |= ids[i];
+    }
+
+    // agreed_mask: bit = 1 where all IDs agree (either all-0 or all-1)
+    //   all_ones            → bits that are 1 in every ID (agreed-1)
+    //   (~any_ones) & full  → bits that are 0 in every ID (agreed-0)
+    uint32_t agreed_mask = all_ones | ((~any_ones) & full);
+
+    *out_id   = all_ones;    // agreed-1 bits carry value 1; agreed-0 stay 0
+    *out_mask = agreed_mask; // only agreed bits are enforced
+
+    // Number of don't-care bit positions = number of 0s in agreed_mask
+    uint32_t dc_bits   = (uint32_t)__builtin_popcount((~agreed_mask) & full);
+    uint32_t n_accepts = (1U << dc_bits);  // IDs that pass = 2^(don't-care bits)
+
+    // Spurious = accepted IDs that are NOT in our list
+    return (n_accepts > (uint32_t)count) ? (n_accepts - (uint32_t)count) : 0;
+}
+
+// Shared disable→reconfigure→enable sequence.
+// The hardware filter registers are write-protected while the node is running.
+static esp_err_t filter_apply_config(const twai_mask_filter_config_t *cfg,
+                                     const char *label)
+{
+    if (s_node_hdl == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    // Disable: immediately stops the node; any in-flight TX is aborted.
+    // The caller is responsible for ensuring no critical TX is pending.
+    esp_err_t ret = twai_node_disable(s_node_hdl);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "%s: twai_node_disable failed: %s", label, esp_err_to_name(ret));
+        return ret;
+    }
+
+    ret = twai_node_config_mask_filter(s_node_hdl, 0, cfg);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "%s: twai_node_config_mask_filter failed: %s",
+                 label, esp_err_to_name(ret));
+        // Best-effort re-enable even on filter error.
+        twai_node_enable(s_node_hdl);
+        return ret;
+    }
+
+    ret = twai_node_enable(s_node_hdl);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "%s: twai_node_enable failed: %s", label, esp_err_to_name(ret));
+    }
+    return ret;
+}
+
+// =============================================================================
+// Filter configuration — explicit (manual)
+// =============================================================================
+
+esp_err_t can_driver_apply_single_filter(uint32_t id, uint32_t mask, bool is_ext)
+{
+    ESP_LOGI(TAG, "Single filter: id=0x%08lX mask=0x%08lX ext=%d",
+             (unsigned long)id, (unsigned long)mask, is_ext);
+
+    twai_mask_filter_config_t cfg = {
+        .id     = id,
+        .mask   = mask,
+        .is_ext = is_ext,
+    };
+    return filter_apply_config(&cfg, "apply_single_filter");
+}
+
+esp_err_t can_driver_apply_dual_filter(uint32_t id1, uint32_t mask1,
+                                        uint32_t id2, uint32_t mask2,
+                                        bool is_ext)
+{
+    ESP_LOGI(TAG, "Dual filter: f1=0x%08lX/0x%08lX  f2=0x%08lX/0x%08lX  ext=%d",
+             (unsigned long)id1, (unsigned long)mask1,
+             (unsigned long)id2, (unsigned long)mask2, is_ext);
+
+    // twai_make_dual_filter() packs both id/mask pairs into the single
+    // twai_mask_filter_config_t register layout expected by the hardware and
+    // sets the internal "dual mode" flag automatically.
+    twai_mask_filter_config_t cfg = twai_make_dual_filter(id1, mask1,
+                                                           id2, mask2,
+                                                           is_ext);
+    return filter_apply_config(&cfg, "apply_dual_filter");
+}
+
+// =============================================================================
+// Filter configuration — automatic (computed from an ID list)
+// =============================================================================
+
+esp_err_t can_driver_apply_single_filter_auto(const uint32_t *ids,
+                                               size_t count,
+                                               bool is_ext)
+{
+    if (ids == NULL && count > 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (count == 0) {
+        ESP_LOGW(TAG, "apply_single_filter_auto: empty list → accept-all");
+        twai_mask_filter_config_t accept_all = { .id = 0, .mask = 0, .is_ext = is_ext };
+        return filter_apply_config(&accept_all, "apply_single_filter_auto");
+    }
+
+    uint32_t filter_id, filter_mask;
+    uint32_t spurious = filter_compute_group(ids, count, is_ext,
+                                             &filter_id, &filter_mask);
+
+    ESP_LOGI(TAG, "Single filter auto (%d IDs): id=0x%08lX mask=0x%08lX spurious=%lu",
+             (int)count,
+             (unsigned long)filter_id, (unsigned long)filter_mask,
+             (unsigned long)spurious);
+
+    twai_mask_filter_config_t cfg = {
+        .id     = filter_id,
+        .mask   = filter_mask,
+        .is_ext = is_ext,
+    };
+    return filter_apply_config(&cfg, "apply_single_filter_auto");
+}
+
+// qsort comparator for uint32_t ascending.
+static int cmp_u32(const void *a, const void *b)
+{
+    uint32_t ua = *(const uint32_t *)a;
+    uint32_t ub = *(const uint32_t *)b;
+    return (ua > ub) - (ua < ub);   // branchless; avoids signed overflow
+}
+
+esp_err_t can_driver_apply_dual_filter_auto(const uint32_t *ids,
+                                             size_t count,
+                                             bool is_ext)
+{
+    if (ids == NULL && count > 0) return ESP_ERR_INVALID_ARG;
+
+    if (count == 0) {
+        ESP_LOGW(TAG, "apply_dual_filter_auto: empty list → accept-all");
+        twai_mask_filter_config_t accept_all = { .id = 0, .mask = 0, .is_ext = is_ext };
+        return filter_apply_config(&accept_all, "apply_dual_filter_auto");
+    }
+
+    if (count == 1) {
+        const uint32_t full = filter_full_mask(is_ext);
+        ESP_LOGI(TAG, "Dual filter auto (1 ID): exact match id=0x%08lX",
+                 (unsigned long)ids[0]);
+        return can_driver_apply_dual_filter(ids[0], full, full, full, is_ext);
+    }
+
+#define DUAL_FILTER_MAX_IDS 2048
+    if (count > DUAL_FILTER_MAX_IDS) {
+        ESP_LOGW(TAG, "apply_dual_filter_auto: %d IDs > %d cap → single filter fallback",
+                 (int)count, DUAL_FILTER_MAX_IDS);
+        return can_driver_apply_single_filter_auto(ids, count, is_ext);
+    }
+
+    uint32_t *sorted = malloc(count * sizeof(uint32_t));  // ← keep this
+    if (sorted == NULL) {
+        ESP_LOGE(TAG, "Failed to allocate memory for ID sorting");
+        return ESP_ERR_NO_MEM;
+    }
+    memcpy(sorted, ids, count * sizeof(uint32_t));        // ← keep this
+    qsort(sorted, count, sizeof(uint32_t), cmp_u32);      // ← keep this
+    // DELETE the three lines that were here: uint32_t sorted[...], memcpy, qsort
+
+    size_t   split_idx = 0;
+    uint32_t max_gap   = 0;
+    for (size_t i = 0; i < count - 1; i++) {
+        uint32_t gap = sorted[i + 1] - sorted[i];
+        if (gap > max_gap) { max_gap = gap; split_idx = i; }
+    }
+
+    const uint32_t *group_a = &sorted[0];
+    size_t          count_a = split_idx + 1;
+    const uint32_t *group_b = &sorted[split_idx + 1];
+    size_t          count_b = count - count_a;
+
+    uint32_t id1, mask1, id2, mask2;
+    uint32_t spurious_a = filter_compute_group(group_a, count_a, is_ext, &id1, &mask1);
+    uint32_t spurious_b = filter_compute_group(group_b, count_b, is_ext, &id2, &mask2);
+
+    ESP_LOGI(TAG,
+             "Dual filter auto (%d IDs, split at gap %lu after 0x%08lX): "
+             "f1=0x%08lX/0x%08lX (%d IDs, %lu spurious)  "
+             "f2=0x%08lX/0x%08lX (%d IDs, %lu spurious)",
+             (int)count, (unsigned long)max_gap, (unsigned long)sorted[split_idx],
+             (unsigned long)id1, (unsigned long)mask1, (int)count_a, (unsigned long)spurious_a,
+             (unsigned long)id2, (unsigned long)mask2, (int)count_b, (unsigned long)spurious_b);
+
+    free(sorted);  // ← must be before return
+    return can_driver_apply_dual_filter(id1, mask1, id2, mask2, is_ext);
+
+#undef DUAL_FILTER_MAX_IDS
 }

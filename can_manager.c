@@ -3,6 +3,7 @@
 #include "can_state.h"
 #include "can_payloads.h"
 #include "can_config.h"
+#include "can_logger.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -135,6 +136,7 @@ static void can_manager_task(void *arg)
         // the bus-off check responsive without burning CPU in a tight loop.
         if (can_driver_receive(&evt, pdMS_TO_TICKS(10)) == ESP_OK) {
             dispatch(&evt);
+            can_logger_post(&evt);
         }
     }
 
