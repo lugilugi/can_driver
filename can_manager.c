@@ -49,7 +49,7 @@ typedef struct {
         .copy_len = (uint8_t)sizeof(_payload_t),                                \
         .state_ptr = &(_state_field),                                            \
         .last_rx_tick_ptr = &(_tick_field),                                      \
-    }
+    },
 
 static const CanCopyRouteDesc_t s_copy_routes[] = {
     CAN_MESSAGE_COPY_ROUTE_TABLE(MAKE_COPY_ROUTE_DESC)

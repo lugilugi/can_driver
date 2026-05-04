@@ -10,6 +10,10 @@
 //
 // Add new standard messages by adding one row here and the corresponding state
 // struct in can_state.h/can_state.c.
+//
+// NOTE: The X-macro table intentionally omits commas between entries.
+// Usage macros (MAKE_COPY_ROUTE_DESC, etc.) must include a trailing comma
+// when used in array initializers, but NOT for count expressions or switch cases.
 // =============================================================================
 
 // name, id, payload_type, state_field, last_rx_tick_field
@@ -27,15 +31,14 @@
     X("DASH_STAT",  CAN_ID_DASH_STAT)
 
 // Compile-time row counts for coverage checks.
+// Both counters share a single named enum so _Static_assert comparisons
+// between them and other enumerators don't trigger -Werror=enum-compare.
 #define CAN_MESSAGE_COUNT_COPY(_name, _id, _payload_t, _state_field, _tick_field) +1
 #define CAN_MESSAGE_COUNT_SPECIAL(_name, _id) +1
 
-enum {
+enum CanMessageCatalogCounts {
     CAN_MESSAGE_COPY_ROUTE_COUNT = 0
-        CAN_MESSAGE_COPY_ROUTE_TABLE(CAN_MESSAGE_COUNT_COPY)
-};
-
-enum {
+        CAN_MESSAGE_COPY_ROUTE_TABLE(CAN_MESSAGE_COUNT_COPY),
     CAN_MESSAGE_SPECIAL_ROUTE_COUNT = 0
         CAN_MESSAGE_SPECIAL_ROUTE_TABLE(CAN_MESSAGE_COUNT_SPECIAL)
 };

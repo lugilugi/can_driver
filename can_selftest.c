@@ -43,7 +43,7 @@ enum {
     CAN_SELFTEST_MANUAL_COPY_ROUTE_TESTS = 4
 };
 
-_Static_assert(CAN_SELFTEST_MANUAL_COPY_ROUTE_TESTS == CAN_MESSAGE_COPY_ROUTE_COUNT,
+_Static_assert((int)CAN_SELFTEST_MANUAL_COPY_ROUTE_TESTS == (int)CAN_MESSAGE_COPY_ROUTE_COUNT,
                "Update can_selftest copy-route roundtrip coverage for new catalog entries");
 
 typedef struct {
@@ -61,7 +61,7 @@ typedef struct {
         .len = (uint8_t)sizeof(_payload_t),                                                \
         .state_ptr = &(_state_field),                                                      \
         .last_rx_tick_ptr = &(_tick_field),                                                \
-    }
+    },
 
 static const CanSelftestCopyRouteDesc_t s_copy_route_desc[] = {
     CAN_MESSAGE_COPY_ROUTE_TABLE(MAKE_SELFTEST_COPY_ROUTE_DESC)
