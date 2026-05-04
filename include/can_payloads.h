@@ -51,8 +51,9 @@ typedef union {
     struct {
         uint8_t deadman_active   : 1; // Bit 0: 1 = Holding, 0 = Dropped
         uint8_t adc_fault        : 1; // Bit 1: 1 = Sensor unplugged/I2C fail
-        uint8_t is_calibrating   : 1; // Bit 2: 1 = NVS calibration running
-        uint8_t reserved         : 5; // Bits 3-7: Unused
+        uint8_t brake_active     : 1; // Bit 2: 1 = Brake pressed
+        uint8_t is_calibrating   : 1; // Bit 3: 1 = NVS calibration running
+        uint8_t reserved         : 4; // Bits 4-7: Unused
     };
     uint8_t pedalFlags;
 } PedalFlags_t;

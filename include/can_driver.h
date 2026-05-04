@@ -5,6 +5,7 @@
 #include "freertos/task.h"
 #include <stdint.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include "hal/gpio_types.h"
 
 // =============================================================================
@@ -106,11 +107,14 @@ esp_err_t can_driver_deinit(void);
 //
 // Returns:
 //   ESP_OK                — frame queued successfully.
-//   ESP_ERR_INVALID_ARG  — len > 8.
+//   ESP_ERR_INVALID_ARG   — len > 8 or data is NULL when len > 0.
 //   ESP_ERR_NO_MEM        — TX pool exhausted; all slots are in-flight.
 //   ESP_ERR_INVALID_STATE — driver not initialized.
 //
 // Thread-safe. Safe to call from task or ISR context.
+// The implementation detects the calling context at runtime via
+// xPortInIsrContext() and uses the matching critical-section primitive
+// (portENTER_CRITICAL vs portENTER_CRITICAL_ISR) for the TX pool spinlock.
 // -----------------------------------------------------------------------------
 esp_err_t can_driver_transmit(uint32_t id, const uint8_t *data, uint8_t len);
 
@@ -120,7 +124,11 @@ esp_err_t can_driver_transmit(uint32_t id, const uint8_t *data, uint8_t len);
 // Block until an RX event is available or timeout_ticks elapses.
 // Intended to be called only by the can_manager task.
 //
-// Returns ESP_OK on success, ESP_ERR_TIMEOUT if the queue was empty.
+// Returns:
+//   ESP_OK                — received one event.
+//   ESP_ERR_TIMEOUT       — queue was empty until timeout.
+//   ESP_ERR_INVALID_ARG   — evt is NULL.
+//   ESP_ERR_INVALID_STATE — driver not initialized/deinitialized.
 // -----------------------------------------------------------------------------
 esp_err_t can_driver_receive(CanRxEvent_t *evt, TickType_t timeout_ticks);
 
@@ -152,10 +160,36 @@ esp_err_t can_driver_recover(void);
 // can_driver_get_isr_rx_fail()  — number of times twai_node_receive_from_isr
 //   returned non-ESP_OK inside on_rx_done.
 //   If this is > 0, the callback fires but the receive call itself is failing.
+
+// can_driver_get_isr_rx_dropped() — number of RX events dropped because the
+// static RX queue was full when posted from ISR.
 //
-// can_driver_reset_isr_counters() — reset both to zero (e.g. before a test).
-//   Also called automatically on can_driver_init().
+// can_driver_reset_isr_counters() — reset all ISR counters to zero
+// (rx callback calls, receive failures, queue-full drops).
+// Also called automatically on can_driver_init().
 // -----------------------------------------------------------------------------
 uint32_t can_driver_get_isr_rx_calls(void);
 uint32_t can_driver_get_isr_rx_fail(void);
+uint32_t can_driver_get_isr_rx_dropped(void);
 void     can_driver_reset_isr_counters(void);
+
+// -----------------------------------------------------------------------------
+// RX filter configuration
+//
+// These APIs configure the TWAI mask filter. The driver performs a
+// disable->reconfigure->enable cycle internally as required by ESP-IDF.
+//
+// Single filter: one ID/mask pair.
+// Dual filter:   two ID/mask pairs packed by TWAI dual-filter mode.
+// Auto variants compute mask filter(s) from an allowlist of IDs.
+// -----------------------------------------------------------------------------
+esp_err_t can_driver_apply_single_filter(uint32_t id, uint32_t mask, bool is_ext);
+esp_err_t can_driver_apply_dual_filter(uint32_t id1, uint32_t mask1,
+                                       uint32_t id2, uint32_t mask2,
+                                       bool is_ext);
+esp_err_t can_driver_apply_single_filter_auto(const uint32_t *ids,
+                                              size_t count,
+                                              bool is_ext);
+esp_err_t can_driver_apply_dual_filter_auto(const uint32_t *ids,
+                                            size_t count,
+                                            bool is_ext);

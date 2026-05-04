@@ -5,6 +5,7 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
+#include "freertos/portmacro.h"
 #include <string.h>
 #include <stdlib.h>
 
@@ -48,6 +49,13 @@ static QueueHandle_t           s_rx_queue = NULL;
 // Bus-off flag — set by ISR, polled and cleared by the manager task.
 // =============================================================================
 static volatile bool s_bus_off_pending = false;
+static portMUX_TYPE  s_bus_off_mux     = portMUX_INITIALIZER_UNLOCKED;
+
+// ISR counter spinlock — protects the task-context read/reset side.
+// ISR increments are unguarded by design: on single-core targets the ISR is
+// naturally atomic; on dual-core the worst case is a missed diagnostic count,
+// which is acceptable given the critical-section overhead saved per frame.
+static portMUX_TYPE  s_isr_cnt_mux     = portMUX_INITIALIZER_UNLOCKED;
 
 // =============================================================================
 // ISR diagnostic counters
@@ -58,15 +66,26 @@ static volatile bool s_bus_off_pending = false;
 // =============================================================================
 static volatile uint32_t s_isr_rx_calls = 0;
 static volatile uint32_t s_isr_rx_fail  = 0;
+static volatile uint32_t s_isr_rx_dropped = 0;
 
 // =============================================================================
 // TX pool helpers
 // =============================================================================
 
-static CanTxSlot_t *tx_pool_claim(void)
+static inline bool in_isr_context(void)
+{
+    return xPortInIsrContext();
+}
+
+static CanTxSlot_t *tx_pool_claim(bool isr_context)
 {
     CanTxSlot_t *slot = NULL;
-    portENTER_CRITICAL(&s_tx_pool_mux);
+    if (isr_context) {
+        portENTER_CRITICAL_ISR(&s_tx_pool_mux);
+    } else {
+        portENTER_CRITICAL(&s_tx_pool_mux);
+    }
+
     for (int i = 0; i < CAN_TX_POOL_SIZE; i++) {
         if (!s_tx_pool[i].in_use) {
             s_tx_pool[i].in_use = true;
@@ -74,16 +93,32 @@ static CanTxSlot_t *tx_pool_claim(void)
             break;
         }
     }
-    portEXIT_CRITICAL(&s_tx_pool_mux);
+
+    if (isr_context) {
+        portEXIT_CRITICAL_ISR(&s_tx_pool_mux);
+    } else {
+        portEXIT_CRITICAL(&s_tx_pool_mux);
+    }
+
     return slot;
 }
 
 // Release from task context (error path in can_driver_transmit).
-static void tx_pool_release(CanTxSlot_t *slot)
+static void tx_pool_release(CanTxSlot_t *slot, bool isr_context)
 {
-    portENTER_CRITICAL(&s_tx_pool_mux);
+    if (isr_context) {
+        portENTER_CRITICAL_ISR(&s_tx_pool_mux);
+    } else {
+        portENTER_CRITICAL(&s_tx_pool_mux);
+    }
+
     slot->in_use = false;
-    portEXIT_CRITICAL(&s_tx_pool_mux);
+
+    if (isr_context) {
+        portEXIT_CRITICAL_ISR(&s_tx_pool_mux);
+    } else {
+        portEXIT_CRITICAL(&s_tx_pool_mux);
+    }
 }
 
 // Release from ISR context — matches slot by frame pointer address.
@@ -143,7 +178,10 @@ static bool IRAM_ATTR on_rx_done(twai_node_handle_t handle,
     memcpy(evt.data, recv_buf, evt.len);
 
     BaseType_t higher_prio_woken = pdFALSE;
-    xQueueSendFromISR(s_rx_queue, &evt, &higher_prio_woken);
+    if (s_rx_queue == NULL ||
+        xQueueSendFromISR(s_rx_queue, &evt, &higher_prio_woken) != pdTRUE) {
+        s_isr_rx_dropped++;
+    }
     return (higher_prio_woken == pdTRUE);
 }
 
@@ -154,7 +192,9 @@ static bool IRAM_ATTR on_state_change(twai_node_handle_t handle,
     if (edata->new_sta == TWAI_ERROR_BUS_OFF) {
         // Signal the manager task — twai_node_recover() must not be called
         // from ISR context.
+        portENTER_CRITICAL_ISR(&s_bus_off_mux);
         s_bus_off_pending = true;
+        portEXIT_CRITICAL_ISR(&s_bus_off_mux);
     }
     return false;
 }
@@ -208,6 +248,7 @@ esp_err_t can_driver_init(gpio_num_t tx, gpio_num_t rx, uint32_t baud, CanInitFl
     s_bus_off_pending = false;
     s_isr_rx_calls    = 0;
     s_isr_rx_fail     = 0;
+    s_isr_rx_dropped  = 0;
 
     twai_onchip_node_config_t node_cfg = {
         .io_cfg.tx                = tx,
@@ -224,6 +265,8 @@ esp_err_t can_driver_init(gpio_num_t tx, gpio_num_t rx, uint32_t baud, CanInitFl
     esp_err_t ret = twai_new_node_onchip(&node_cfg, &s_node_hdl);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "twai_new_node_onchip failed: %s", esp_err_to_name(ret));
+        vQueueDelete(s_rx_queue);
+        s_rx_queue = NULL;
         return ret;
     }
 
@@ -267,8 +310,14 @@ esp_err_t can_driver_init(gpio_num_t tx, gpio_num_t rx, uint32_t baud, CanInitFl
     return ESP_OK;
 
 cleanup:
-    twai_node_delete(s_node_hdl);
+    if (s_node_hdl != NULL) {
+        twai_node_delete(s_node_hdl);
+    }
     s_node_hdl = NULL;
+    if (s_rx_queue != NULL) {
+        vQueueDelete(s_rx_queue);
+        s_rx_queue = NULL;
+    }
     return ret;
 }
 
@@ -280,20 +329,29 @@ esp_err_t can_driver_deinit(void)
     twai_node_disable(s_node_hdl);
     esp_err_t ret = twai_node_delete(s_node_hdl);
     s_node_hdl = NULL;
+    if (s_rx_queue != NULL) {
+        vQueueDelete(s_rx_queue);
+        s_rx_queue = NULL;
+    }
+    portENTER_CRITICAL(&s_bus_off_mux);
+    s_bus_off_pending = false;
+    portEXIT_CRITICAL(&s_bus_off_mux);
     ESP_LOGI(TAG, "Deinitialized");
     return ret;
 }
 
 esp_err_t can_driver_transmit(uint32_t id, const uint8_t *data, uint8_t len)
 {
+    bool isr_context = in_isr_context();
+
     if (s_node_hdl == NULL) {
         return ESP_ERR_INVALID_STATE;
     }
-    if (len > 8) {
+    if (len > 8 || (len > 0 && data == NULL)) {
         return ESP_ERR_INVALID_ARG;
     }
 
-    CanTxSlot_t *slot = tx_pool_claim();
+    CanTxSlot_t *slot = tx_pool_claim(isr_context);
     if (slot == NULL) {
         return ESP_ERR_NO_MEM;
     }
@@ -310,15 +368,24 @@ esp_err_t can_driver_transmit(uint32_t id, const uint8_t *data, uint8_t len)
     // dropped and the slot is released immediately.
     esp_err_t ret = twai_node_transmit(s_node_hdl, &slot->frame, 0);
     if (ret != ESP_OK) {
-        tx_pool_release(slot);
-        ESP_LOGW(TAG, "twai_node_transmit failed (id=0x%03lX): %s",
-                 (unsigned long)id, esp_err_to_name(ret));
+        tx_pool_release(slot, isr_context);
+        if (!isr_context) {
+            ESP_LOGW(TAG, "twai_node_transmit failed (id=0x%03lX): %s",
+                     (unsigned long)id, esp_err_to_name(ret));
+        }
     }
     return ret;
 }
 
 esp_err_t can_driver_receive(CanRxEvent_t *evt, TickType_t timeout_ticks)
 {
+    if (evt == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (s_node_hdl == NULL || s_rx_queue == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
     if (xQueueReceive(s_rx_queue, evt, timeout_ticks) == pdTRUE) {
         return ESP_OK;
     }
@@ -338,12 +405,18 @@ int can_driver_get_pool_used(void)
 
 bool can_driver_is_bus_off(void)
 {
-    return s_bus_off_pending;
+    bool pending;
+    portENTER_CRITICAL(&s_bus_off_mux);
+    pending = s_bus_off_pending;
+    portEXIT_CRITICAL(&s_bus_off_mux);
+    return pending;
 }
 
 void can_driver_clear_bus_off(void)
 {
+    portENTER_CRITICAL(&s_bus_off_mux);
     s_bus_off_pending = false;
+    portEXIT_CRITICAL(&s_bus_off_mux);
 }
 
 esp_err_t can_driver_recover(void)
@@ -356,18 +429,38 @@ esp_err_t can_driver_recover(void)
 
 uint32_t can_driver_get_isr_rx_calls(void)
 {
-    return s_isr_rx_calls;
+    uint32_t val;
+    portENTER_CRITICAL(&s_isr_cnt_mux);
+    val = s_isr_rx_calls;
+    portEXIT_CRITICAL(&s_isr_cnt_mux);
+    return val;
 }
 
 uint32_t can_driver_get_isr_rx_fail(void)
 {
-    return s_isr_rx_fail;
+    uint32_t val;
+    portENTER_CRITICAL(&s_isr_cnt_mux);
+    val = s_isr_rx_fail;
+    portEXIT_CRITICAL(&s_isr_cnt_mux);
+    return val;
+}
+
+uint32_t can_driver_get_isr_rx_dropped(void)
+{
+    uint32_t val;
+    portENTER_CRITICAL(&s_isr_cnt_mux);
+    val = s_isr_rx_dropped;
+    portEXIT_CRITICAL(&s_isr_cnt_mux);
+    return val;
 }
 
 void can_driver_reset_isr_counters(void)
 {
-    s_isr_rx_calls = 0;
-    s_isr_rx_fail  = 0;
+    portENTER_CRITICAL(&s_isr_cnt_mux);
+    s_isr_rx_calls   = 0;
+    s_isr_rx_fail    = 0;
+    s_isr_rx_dropped = 0;
+    portEXIT_CRITICAL(&s_isr_cnt_mux);
 }
 
 // =============================================================================
@@ -540,6 +633,12 @@ static int cmp_u32(const void *a, const void *b)
     return (ua > ub) - (ua < ub);   // branchless; avoids signed overflow
 }
 
+// Stack-allocated scratch cap for dual filter auto.
+// 128 IDs × 4 bytes = 512 bytes on stack — safe for typical task stacks and
+// avoids non-deterministic heap allocation in a peripheral configuration path.
+// Lists exceeding this cap fall back to single-filter mode.
+#define DUAL_FILTER_MAX_IDS 128
+
 esp_err_t can_driver_apply_dual_filter_auto(const uint32_t *ids,
                                              size_t count,
                                              bool is_ext)
@@ -559,21 +658,16 @@ esp_err_t can_driver_apply_dual_filter_auto(const uint32_t *ids,
         return can_driver_apply_dual_filter(ids[0], full, full, full, is_ext);
     }
 
-#define DUAL_FILTER_MAX_IDS 2048
     if (count > DUAL_FILTER_MAX_IDS) {
         ESP_LOGW(TAG, "apply_dual_filter_auto: %d IDs > %d cap → single filter fallback",
                  (int)count, DUAL_FILTER_MAX_IDS);
         return can_driver_apply_single_filter_auto(ids, count, is_ext);
     }
 
-    uint32_t *sorted = malloc(count * sizeof(uint32_t));  // ← keep this
-    if (sorted == NULL) {
-        ESP_LOGE(TAG, "Failed to allocate memory for ID sorting");
-        return ESP_ERR_NO_MEM;
-    }
-    memcpy(sorted, ids, count * sizeof(uint32_t));        // ← keep this
-    qsort(sorted, count, sizeof(uint32_t), cmp_u32);      // ← keep this
-    // DELETE the three lines that were here: uint32_t sorted[...], memcpy, qsort
+    // Stack-allocated scratch — no heap, deterministic lifetime.
+    uint32_t sorted[DUAL_FILTER_MAX_IDS];
+    memcpy(sorted, ids, count * sizeof(uint32_t));
+    qsort(sorted, count, sizeof(uint32_t), cmp_u32);
 
     size_t   split_idx = 0;
     uint32_t max_gap   = 0;
@@ -599,8 +693,5 @@ esp_err_t can_driver_apply_dual_filter_auto(const uint32_t *ids,
              (unsigned long)id1, (unsigned long)mask1, (int)count_a, (unsigned long)spurious_a,
              (unsigned long)id2, (unsigned long)mask2, (int)count_b, (unsigned long)spurious_b);
 
-    free(sorted);  // ← must be before return
     return can_driver_apply_dual_filter(id1, mask1, id2, mask2, is_ext);
-
-#undef DUAL_FILTER_MAX_IDS
 }

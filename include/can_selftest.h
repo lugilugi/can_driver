@@ -40,6 +40,7 @@ typedef enum {
     CAN_TEST_INIT_LOOPBACK,     // loopback flag init succeeds, self_test implied
     CAN_TEST_MANAGER_INIT,      // manager starts successfully
     CAN_TEST_RX_TIMEOUT,        // receive times out on an empty queue
+    CAN_TEST_CATALOG_COPY_ROUTES, // every catalog copy-route updates expected state
     CAN_TEST_PEDAL_ROUNDTRIP,   // PedalPayload encode → TX → RX → state update
     CAN_TEST_AUX_ROUNDTRIP,     // AuxControlPayload roundtrip
     CAN_TEST_PWR780_ROUNDTRIP,  // PowerPayload (INA780 scale) roundtrip

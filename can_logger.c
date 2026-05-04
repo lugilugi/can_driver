@@ -1,5 +1,8 @@
 #include "can_logger.h"
 #include "can_config.h"
+
+#if CAN_LOGGER_ENABLED
+
 #include "esp_log.h"
 #include "esp_vfs_fat.h"
 #include "sdmmc_cmd.h"
@@ -8,6 +11,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include <string.h>
 #include <stdio.h>
 #include <sys/time.h>
@@ -57,9 +61,37 @@ static TickType_t    s_anchor_tick   = 0;
 static volatile bool s_time_anchored = false;
 static volatile bool s_sync_pending  = false;
 
+static void time_get_snapshot(int64_t *epoch_ms, TickType_t *anchor_tick, bool *anchored)
+{
+    portENTER_CRITICAL(&s_time_mux);
+    *epoch_ms   = s_rtc_epoch_ms;
+    *anchor_tick = s_anchor_tick;
+    *anchored   = s_time_anchored;
+    portEXIT_CRITICAL(&s_time_mux);
+}
+
+static bool time_take_sync_pending(void)
+{
+    bool pending;
+    portENTER_CRITICAL(&s_time_mux);
+    pending = s_sync_pending;
+    s_sync_pending = false;
+    portEXIT_CRITICAL(&s_time_mux);
+    return pending;
+}
+
 static inline int64_t to_wall_ms(TickType_t rx_tick)
 {
-    return s_rtc_epoch_ms + (int64_t)(rx_tick - s_anchor_tick);
+    int64_t epoch_ms;
+    TickType_t anchor_tick;
+    bool anchored;
+
+    time_get_snapshot(&epoch_ms, &anchor_tick, &anchored);
+    if (!anchored) {
+        return (int64_t)rx_tick;
+    }
+
+    return epoch_ms + (int64_t)(rx_tick - anchor_tick);
 }
 
 // =============================================================================
@@ -68,7 +100,8 @@ static inline int64_t to_wall_ms(TickType_t rx_tick)
 static StaticQueue_t     s_queue_struct;
 static uint8_t           s_queue_storage[CAN_LOGGER_QUEUE_DEPTH * sizeof(CanRxEvent_t)];
 static QueueHandle_t     s_log_queue = NULL;
-static volatile uint32_t s_drops     = 0;
+static portMUX_TYPE      s_drop_mux  = portMUX_INITIALIZER_UNLOCKED;
+static uint32_t          s_drops     = 0;
 
 // =============================================================================
 // Flush buffer
@@ -91,6 +124,25 @@ static StaticTask_t  s_task_buf;
 static StackType_t   s_task_stack[CAN_LOGGER_TASK_STACK_SIZE];
 static TaskHandle_t  s_task_hdl = NULL;
 static volatile bool s_running  = false;
+static StaticSemaphore_t s_stop_sem_buf;
+static SemaphoreHandle_t s_stop_sem = NULL;
+
+static void drops_inc(void)
+{
+    portENTER_CRITICAL(&s_drop_mux);
+    s_drops++;
+    portEXIT_CRITICAL(&s_drop_mux);
+}
+
+static uint32_t drops_take_clear(void)
+{
+    uint32_t d;
+    portENTER_CRITICAL(&s_drop_mux);
+    d = s_drops;
+    s_drops = 0;
+    portEXIT_CRITICAL(&s_drop_mux);
+    return d;
+}
 
 // =============================================================================
 // SD mount / unmount
@@ -186,9 +238,15 @@ static void sd_unmount(void)
 static esp_err_t open_file(void)
 {
     char path[64];
+    int64_t epoch_ms;
+    TickType_t anchor_tick;
+    bool anchored;
 
-    if (s_time_anchored) {
-        time_t t = (time_t)(s_rtc_epoch_ms / 1000);
+    time_get_snapshot(&epoch_ms, &anchor_tick, &anchored);
+    (void)anchor_tick;
+
+    if (anchored) {
+        time_t t = (time_t)(epoch_ms / 1000);
         struct tm tm_info;
         gmtime_r(&t, &tm_info);
         snprintf(path, sizeof(path),
@@ -252,7 +310,7 @@ static void write_marker(uint8_t flags)
     if (s_flush_pending >= CAN_LOGGER_FLUSH_RECORDS) flush();
     CanLogRecord_t *rec = &s_flush_buf[s_flush_pending++];
     memset(rec, 0, sizeof(*rec));
-    rec->wall_time_ms = s_time_anchored ? to_wall_ms(xTaskGetTickCount()) : 0;
+    rec->wall_time_ms = to_wall_ms(xTaskGetTickCount());
     rec->id    = 0xFFFFFFFF;
     rec->flags = flags;
     flush();
@@ -273,8 +331,7 @@ static void logger_task(void *arg)
 
     while (s_running) {
 
-        if (s_sync_pending) {
-            s_sync_pending = false;
+        if (time_take_sync_pending()) {
             write_marker(CAN_LOG_FLAG_SYNC);
             last_flush = xTaskGetTickCount();
         }
@@ -292,9 +349,7 @@ static void logger_task(void *arg)
 
             CanLogRecord_t *rec = &s_flush_buf[s_flush_pending++];
             memset(rec->_pad, 0, sizeof(rec->_pad));
-            rec->wall_time_ms = s_time_anchored
-                                ? to_wall_ms(evt.rx_tick)
-                                : (int64_t)evt.rx_tick;
+            rec->wall_time_ms = to_wall_ms(evt.rx_tick);
             rec->id    = evt.id;
             rec->len   = evt.len;
             rec->flags = CAN_LOG_FLAG_NORMAL;
@@ -322,6 +377,9 @@ static void logger_task(void *arg)
     if (s_file != NULL) fflush(s_file);
 
     ESP_LOGI(TAG, "Logger task stopping");
+    if (s_stop_sem != NULL) {
+        xSemaphoreGive(s_stop_sem);
+    }
     s_task_hdl = NULL;
     vTaskDelete(NULL);
 }
@@ -334,6 +392,15 @@ esp_err_t can_logger_init(void)
 {
     if (s_task_hdl != NULL) return ESP_ERR_INVALID_STATE;
 
+    if (s_stop_sem == NULL) {
+        s_stop_sem = xSemaphoreCreateBinaryStatic(&s_stop_sem_buf);
+        if (s_stop_sem == NULL) {
+            ESP_LOGE(TAG, "Failed to create stop semaphore");
+            return ESP_FAIL;
+        }
+    }
+    xSemaphoreTake(s_stop_sem, 0);
+
     s_log_queue = xQueueCreateStatic(
         CAN_LOGGER_QUEUE_DEPTH, sizeof(CanRxEvent_t),
         s_queue_storage, &s_queue_struct);
@@ -343,10 +410,17 @@ esp_err_t can_logger_init(void)
     }
 
     esp_err_t ret = sd_mount();
-    if (ret != ESP_OK) return ret;
+    if (ret != ESP_OK) {
+        s_log_queue = NULL;
+        return ret;
+    }
 
     ret = open_file();
-    if (ret != ESP_OK) { sd_unmount(); return ret; }
+    if (ret != ESP_OK) {
+        sd_unmount();
+        s_log_queue = NULL;
+        return ret;
+    }
 
     s_flush_pending = 0;
     s_drops         = 0;
@@ -362,6 +436,7 @@ esp_err_t can_logger_init(void)
         s_running = false;
         close_file();
         sd_unmount();
+        s_log_queue = NULL;
         ESP_LOGE(TAG, "Failed to create logger task");
         return ESP_FAIL;
     }
@@ -377,15 +452,17 @@ esp_err_t can_logger_deinit(void)
     if (s_task_hdl == NULL) return ESP_ERR_INVALID_STATE;
 
     s_running = false;
-    vTaskDelay(pdMS_TO_TICKS(CAN_LOGGER_FLUSH_INTERVAL_MS + 100));
 
-    if (s_task_hdl != NULL) {
-        vTaskDelete(s_task_hdl);
-        s_task_hdl = NULL;
+    if (s_stop_sem == NULL ||
+        xSemaphoreTake(s_stop_sem,
+                       pdMS_TO_TICKS(CAN_LOGGER_FLUSH_INTERVAL_MS + 300)) != pdTRUE) {
+        ESP_LOGE(TAG, "Timed out waiting for logger task to stop");
+        return ESP_ERR_TIMEOUT;
     }
 
     close_file();
     sd_unmount();
+    s_log_queue = NULL;
     return ESP_OK;
 }
 
@@ -394,15 +471,15 @@ void can_logger_anchor_time(void)
     struct timeval tv;
     TickType_t tick;
 
-    portENTER_CRITICAL(&s_time_mux);
     gettimeofday(&tv, NULL);
     tick = xTaskGetTickCount();
-    portEXIT_CRITICAL(&s_time_mux);
 
+    portENTER_CRITICAL(&s_time_mux);
     s_rtc_epoch_ms  = (int64_t)tv.tv_sec * 1000LL + (int64_t)(tv.tv_usec / 1000);
     s_anchor_tick   = tick;
     s_time_anchored = true;
     s_sync_pending  = true;
+    portEXIT_CRITICAL(&s_time_mux);
 
     ESP_LOGI(TAG, "Time anchored: epoch=%lld ms tick=%lu",
              (long long)s_rtc_epoch_ms, (unsigned long)tick);
@@ -410,8 +487,12 @@ void can_logger_anchor_time(void)
 
 void can_logger_post(const CanRxEvent_t *evt)
 {
+    if (evt == NULL || s_log_queue == NULL) {
+        return;
+    }
+
     if (xQueueSend(s_log_queue, evt, 0) != pdTRUE) {
-        s_drops++;
+        drops_inc();
     }
 }
 
@@ -422,7 +503,7 @@ bool can_logger_is_running(void)
 
 uint32_t can_logger_get_drop_count(void)
 {
-    uint32_t d = s_drops;
-    s_drops = 0;
-    return d;
+    return drops_take_clear();
 }
+
+#endif // CAN_LOGGER_ENABLED

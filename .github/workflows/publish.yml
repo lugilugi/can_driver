@@ -7,7 +7,36 @@ on:
       - 'v*.*.*'
 
 jobs:
+  # Build gate — verify the component compiles for all supported targets
+  # before publishing to the ESP Component Registry.
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        target: [esp32, esp32c3, esp32s3]
+    container:
+      image: espressif/idf:v5.5.3
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build basic_test example
+        working-directory: examples/basic_test
+        run: |
+          . $IDF_PATH/export.sh
+          idf.py set-target ${{ matrix.target }}
+          idf.py build
+
+      - name: Build selftest example
+        working-directory: examples/selftest
+        run: |
+          . $IDF_PATH/export.sh
+          idf.py set-target ${{ matrix.target }}
+          idf.py build
+
   upload_component:
+    needs: build
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code

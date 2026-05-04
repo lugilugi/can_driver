@@ -22,11 +22,9 @@
 //   For telemetry fields (float, bool, TickType_t), reads are safe without locks
 //   because each field is ≤32 bits and individually atomic on 32-bit RISC-V.
 //
-//   EXCEPTION: CanStateEnergy_t::joules_780 and joules_740 are 64-bit doubles.
-//   A context-switch mid-write can produce a torn read. The manager task wraps
-//   energy writes in a critical section. If your application reads energy in a
-//   time-critical path, wrap the read in portENTER_CRITICAL / portEXIT_CRITICAL
-//   as well.
+//   EXCEPTION: CanStateEnergy_t::data is a 5-byte payload and not atomically
+//   readable/writable as a unit. Use can_state_set_energy_raw() and
+//   can_state_get_energy_raw() for synchronized access.
 // =============================================================================
 
 // -----------------------------------------------------------------------------
@@ -63,10 +61,11 @@ typedef struct {
 } CanStatePwr740_t;
 
 // -----------------------------------------------------------------------------
-// CAN_ID_PWR_ENERGY (0x312) — Accumulated energy from the INA sensors.
-// Both INA780 and INA740 interpretations are stored; the application picks
-// whichever is appropriate for its context.
-// NOTE: doubles are 64-bit — see thread safety note above.
+// CAN_ID_PWR_ENERGY (0x312) — Raw 40-bit energy accumulator from INA sensors.
+// The application converts to joules via EnergyPayload_getJoules_780/740().
+// NOTE: The 5-byte EnergyPayload is not atomically readable as a unit.
+// Use can_state_get_energy_raw() / can_state_set_energy_raw() for
+// synchronized access — see thread safety note above.
 // -----------------------------------------------------------------------------
 typedef struct {
     EnergyPayload data;        // 5 bytes (raw 40-bit accumulator)
@@ -101,6 +100,11 @@ extern CanStateDash_t    g_can_dash;
 
 /**
  * @brief Safely copies the 5-byte energy payload to prevent torn reads.
- * Use this instead of accessing g_can_energy.raw directly.
+ * Use this instead of reading g_can_energy.data directly in critical paths.
  */
 void can_state_get_energy_raw(EnergyPayload *dest);
+
+/**
+ * @brief Safely updates energy payload and timestamp as one synchronized write.
+ */
+void can_state_set_energy_raw(const EnergyPayload *src, TickType_t rx_tick);

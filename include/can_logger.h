@@ -38,6 +38,10 @@
 //   4. can_logger_deinit()       -- flush, close, unmount
 // =============================================================================
 
+#include "can_config.h"
+
+#if CAN_LOGGER_ENABLED
+
 // Initialise SDMMC, mount FAT filesystem, open first log file, start task.
 esp_err_t can_logger_init(void);
 
@@ -45,24 +49,24 @@ esp_err_t can_logger_init(void);
 esp_err_t can_logger_deinit(void);
 
 // Anchor logger time to the RTC.
-//
-// Reads the system clock (your RTC driver must have called settimeofday()
-// before this), captures xTaskGetTickCount() at the same instant, and stores
-// the offset. Every log record's rx_tick is then converted to wall-clock ms
-// via pure arithmetic — no further RTC reads needed.
-//
-// Safe to call again if the RTC is re-synced mid-session. A sync marker
-// record (id=0xFFFFFFFF) is written to the log so parsers can detect the
-// correction point.
 void can_logger_anchor_time(void);
 
-// Post a received frame to the logger queue. Non-blocking — drops silently
-// if the queue is full rather than stalling the manager task.
+// Post a received frame to the logger queue. Non-blocking.
 void can_logger_post(const CanRxEvent_t *evt);
 
 // Returns true if the logger task is running and the SD card is mounted.
 bool can_logger_is_running(void);
 
-// Returns the number of frames dropped due to a full queue since the last
-// call (read-and-clear).
+// Returns frames dropped since last call (read-and-clear).
 uint32_t can_logger_get_drop_count(void);
+
+#else
+
+static inline esp_err_t can_logger_init(void)             { return ESP_OK; }
+static inline esp_err_t can_logger_deinit(void)           { return ESP_OK; }
+static inline void      can_logger_anchor_time(void)      { }
+static inline void      can_logger_post(const CanRxEvent_t *evt) { (void)evt; }
+static inline bool      can_logger_is_running(void)       { return false; }
+static inline uint32_t  can_logger_get_drop_count(void)   { return 0; }
+
+#endif // CAN_LOGGER_ENABLED

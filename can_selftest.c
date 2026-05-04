@@ -2,6 +2,7 @@
 #include "can_driver.h"
 #include "can_manager.h"
 #include "can_state.h"
+#include "can_message_catalog.h"
 #include "can_payloads.h"
 #include "can_config.h"
 #include "esp_log.h"
@@ -37,6 +38,35 @@ static bool double_close(double a, double b, double eps)
 // margin for the FreeRTOS scheduler.
 #define MANAGER_SETTLE_MS   50
 
+// Keep these manual roundtrip checks aligned with catalog copy-routes.
+enum {
+    CAN_SELFTEST_MANUAL_COPY_ROUTE_TESTS = 4
+};
+
+_Static_assert(CAN_SELFTEST_MANUAL_COPY_ROUTE_TESTS == CAN_MESSAGE_COPY_ROUTE_COUNT,
+               "Update can_selftest copy-route roundtrip coverage for new catalog entries");
+
+typedef struct {
+    const char *name;
+    uint32_t id;
+    uint8_t len;
+    void *state_ptr;
+    TickType_t *last_rx_tick_ptr;
+} CanSelftestCopyRouteDesc_t;
+
+#define MAKE_SELFTEST_COPY_ROUTE_DESC(_name, _id, _payload_t, _state_field, _tick_field) \
+    {                                                                                      \
+        .name = (_name),                                                                   \
+        .id = (_id),                                                                       \
+        .len = (uint8_t)sizeof(_payload_t),                                                \
+        .state_ptr = &(_state_field),                                                      \
+        .last_rx_tick_ptr = &(_tick_field),                                                \
+    }
+
+static const CanSelftestCopyRouteDesc_t s_copy_route_desc[] = {
+    CAN_MESSAGE_COPY_ROUTE_TABLE(MAKE_SELFTEST_COPY_ROUTE_DESC)
+};
+
 // =============================================================================
 // Test bookkeeping
 // =============================================================================
@@ -49,6 +79,7 @@ static const char *s_test_names[CAN_TEST_COUNT] = {
     [CAN_TEST_INIT_LOOPBACK]        = "Init (loopback + self_test flags)",
     [CAN_TEST_MANAGER_INIT]         = "Manager init",
     [CAN_TEST_RX_TIMEOUT]           = "RX timeout on empty queue",
+    [CAN_TEST_CATALOG_COPY_ROUTES]  = "Catalog copy-route smoke coverage",
     [CAN_TEST_PEDAL_ROUNDTRIP]      = "Pedal payload roundtrip",
     [CAN_TEST_AUX_ROUNDTRIP]        = "AUX control roundtrip",
     [CAN_TEST_PWR780_ROUNDTRIP]     = "Power 780 roundtrip",
@@ -82,7 +113,7 @@ static void fail(CanTestID_t id, const char *reason)
 static void test_preinit_guard(void)
 {
     uint8_t dummy = 0xA6;
-    esp_err_t ret = can_driver_transmit(CAN_ID_PEDAL, &dummy, sizeof(PedalPayload));
+    esp_err_t ret = can_driver_transmit(CAN_ID_PEDAL, &dummy, 1);
     if (ret == ESP_ERR_INVALID_STATE) {
         pass(CAN_TEST_PREINIT_GUARD);
     } else {
@@ -145,6 +176,52 @@ static void test_rx_timeout(void)
     esp_err_t ret = can_driver_receive(&discard, pdMS_TO_TICKS(5));
     if (ret == ESP_ERR_TIMEOUT) pass(CAN_TEST_RX_TIMEOUT);
     else fail(CAN_TEST_RX_TIMEOUT, "Expected ESP_ERR_TIMEOUT on empty queue");
+}
+
+// --- CAN_TEST_CATALOG_COPY_ROUTES --------------------------------------------
+static void test_catalog_copy_routes(void)
+{
+    uint8_t tx_buf[8] = {0};
+
+    for (size_t i = 0; i < (sizeof(s_copy_route_desc) / sizeof(s_copy_route_desc[0])); i++) {
+        const CanSelftestCopyRouteDesc_t *route = &s_copy_route_desc[i];
+
+        if (route->len == 0 || route->len > 8) {
+            ESP_LOGE(TAG, "Catalog route '%s' has invalid payload length %u",
+                     route->name, (unsigned)route->len);
+            fail(CAN_TEST_CATALOG_COPY_ROUTES, "Invalid catalog route payload length");
+            return;
+        }
+
+        memset(route->state_ptr, 0, route->len);
+        *route->last_rx_tick_ptr = 0;
+
+        for (uint8_t j = 0; j < route->len; j++) {
+            tx_buf[j] = (uint8_t)(0x30 + (uint8_t)i + j);
+        }
+
+        if (can_driver_transmit(route->id, tx_buf, route->len) != ESP_OK) {
+            ESP_LOGE(TAG, "Catalog route '%s' TX failed", route->name);
+            fail(CAN_TEST_CATALOG_COPY_ROUTES, "Catalog route TX failed");
+            return;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(MANAGER_SETTLE_MS));
+
+        if (*route->last_rx_tick_ptr == 0) {
+            ESP_LOGE(TAG, "Catalog route '%s' did not update last_rx_tick", route->name);
+            fail(CAN_TEST_CATALOG_COPY_ROUTES, "Catalog route did not update state timestamp");
+            return;
+        }
+
+        if (memcmp(route->state_ptr, tx_buf, route->len) != 0) {
+            ESP_LOGE(TAG, "Catalog route '%s' payload copy mismatch", route->name);
+            fail(CAN_TEST_CATALOG_COPY_ROUTES, "Catalog route payload copy mismatch");
+            return;
+        }
+    }
+
+    pass(CAN_TEST_CATALOG_COPY_ROUTES);
 }
 
 // --- CAN_TEST_PEDAL_ROUNDTRIP ------------------------------------------------
@@ -214,7 +291,7 @@ static void test_aux_roundtrip(void)
         fail(CAN_TEST_AUX_ROUNDTRIP, "State not updated"); return;
     }
     
-    // FIX: Changed .ctrl to .data to match the union layout
+    // Access bitfields through the current union field layout.
     if (g_can_aux.data.headlights != 1 || g_can_aux.data.left_turn != 1) {
         fail(CAN_TEST_AUX_ROUNDTRIP, "Set bits mismatch"); return;
     }
@@ -238,7 +315,6 @@ static void test_pwr780_roundtrip(void)
     PowerPayload p;
     PowerPayload_setRaw(&p, raw_v, raw_a);
 
-    // FIX: Cast struct address to uint8_t array
     if (can_driver_transmit(CAN_ID_PWR_MONITOR_780, (const uint8_t *)&p, sizeof(PowerPayload)) != ESP_OK) {
         fail(CAN_TEST_PWR780_ROUNDTRIP, "TX failed"); return;
     }
@@ -248,7 +324,6 @@ static void test_pwr780_roundtrip(void)
         fail(CAN_TEST_PWR780_ROUNDTRIP, "State not updated"); return;
     }
 
-    // FIX: Use getter functions
     float actual_v = PowerPayload_getVoltage(&g_can_pwr780.data);
     float actual_a = PowerPayload_getCurrent_780(&g_can_pwr780.data);
 
@@ -274,7 +349,6 @@ static void test_pwr740_roundtrip(void)
     PowerPayload p;
     PowerPayload_setRaw(&p, raw_v, raw_a);
 
-    // FIX: Cast struct address to uint8_t array
     if (can_driver_transmit(CAN_ID_PWR_MONITOR_740, (const uint8_t *)&p, sizeof(PowerPayload)) != ESP_OK) {
         fail(CAN_TEST_PWR740_ROUNDTRIP, "TX failed"); return;
     }
@@ -284,7 +358,6 @@ static void test_pwr740_roundtrip(void)
         fail(CAN_TEST_PWR740_ROUNDTRIP, "State not updated"); return;
     }
 
-    // FIX: Use getter functions
     float actual_v = PowerPayload_getVoltage(&g_can_pwr740.data);
     float actual_a = PowerPayload_getCurrent_740(&g_can_pwr740.data);
 
@@ -318,7 +391,7 @@ static void test_energy_roundtrip(void)
         fail(CAN_TEST_ENERGY_ROUNDTRIP, "State not updated"); return;
     }
 
-    // FIX: Read safely through the mutex helper, then decode
+    // Read the 5-byte payload through the synchronized state accessor.
     EnergyPayload safe_energy_rx;
     can_state_get_energy_raw(&safe_energy_rx);
 
@@ -391,8 +464,8 @@ static void test_deinit(void)
         fail(CAN_TEST_DEINIT, "can_driver_deinit() failed"); return;
     }
 
-    uint8_t dummy = 0xFD; // Increased to 6 bytes
-    if (can_driver_transmit(CAN_ID_PEDAL, &dummy, sizeof(PedalPayload)) != ESP_ERR_INVALID_STATE) {
+    uint8_t dummy = 0xFD;
+    if (can_driver_transmit(CAN_ID_PEDAL, &dummy, 1) != ESP_ERR_INVALID_STATE) {
         fail(CAN_TEST_DEINIT, "Pre-init guard not restored after deinit"); return;
     }
     pass(CAN_TEST_DEINIT);
@@ -461,6 +534,7 @@ CanSelftestResult_t can_selftest_run_detailed(void)
 
     // Phase 5: Functional
     test_rx_timeout();
+    test_catalog_copy_routes();
     test_pedal_roundtrip();
     test_aux_roundtrip();
     test_pwr780_roundtrip();

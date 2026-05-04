@@ -96,3 +96,6 @@
 #define CAN_LOGGER_SPI_MOSI     2
 #define CAN_LOGGER_SPI_MISO     12
 #define CAN_LOGGER_SPI_CS       4
+
+#define CAN_USB_FORWARD_ENABLED   0   // flip to 1 to enable
+#define CAN_LOGGER_ENABLED        0   // flip to 1 to enable
