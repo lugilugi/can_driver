@@ -21,6 +21,14 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ matrix.target }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ matrix.target }}-
+
       - name: Build dbc_usage example
         working-directory: examples/dbc_usage
         run: |

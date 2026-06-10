@@ -1,11 +1,9 @@
-
+  
 description: "ECT TWAI DRIVER"
 url: "https://github.com/lugilugi/can_driver"
 examples:
-  - path: examples/basic_test
-  - path: examples/manager_state
-  - path: examples/selftest
-  - path: examples/unit_test
+  - path: examples/dbc_usage
+  - path: examples/light_board
 license: "MIT"
 dependencies:
   idf:
