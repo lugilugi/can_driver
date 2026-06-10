@@ -21,15 +21,15 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Build basic_test example
-        working-directory: examples/basic_test
+      - name: Build dbc_usage example
+        working-directory: examples/dbc_usage
         run: |
           . $IDF_PATH/export.sh
           idf.py set-target ${{ matrix.target }}
           idf.py build
 
-      - name: Build selftest example
-        working-directory: examples/selftest
+      - name: Build light_board example
+        working-directory: examples/light_board
         run: |
           . $IDF_PATH/export.sh
           idf.py set-target ${{ matrix.target }}
