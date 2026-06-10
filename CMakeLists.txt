@@ -8,6 +8,7 @@ set(can_srcs
 )
 
 set(can_requires
+    driver
     esp_driver_twai
     freertos
     log
