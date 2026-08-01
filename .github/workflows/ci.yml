@@ -10,7 +10,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     strategy:
-      fail-fast: true
+      fail-fast: false
       matrix:
         example: [dbc_usage, light_board]
     container:
@@ -23,12 +23,15 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.ccache
-          key: ccache-esp32c3-${{ matrix.example }}-${{ github.sha }}
+          key: ccache-esp32c3-${{ matrix.example }}-${{ github.run_id }}
           restore-keys: |
+            ccache-esp32c3-${{ matrix.example }}-${{ github.ref }}
             ccache-esp32c3-${{ matrix.example }}-
 
       - name: Build ${{ matrix.example }} example
         working-directory: examples/${{ matrix.example }}
+        env:
+          IDF_CCACHE_ENABLE: "1"
         run: |
           . $IDF_PATH/export.sh
           idf.py set-target esp32c3

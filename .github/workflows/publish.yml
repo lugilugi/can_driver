@@ -1,20 +1,18 @@
 name: Publish to ESP Registry
 
 on:
-  workflow_dispatch: 
+  workflow_dispatch:
   push:
     tags:
       - 'v*.*.*'
 
 jobs:
-  # Build gate — verify the component compiles for all supported targets
-  # before publishing to the ESP Component Registry.
   build:
     runs-on: ubuntu-latest
     strategy:
-      fail-fast: true
+      fail-fast: false
       matrix:
-        target: [esp32c3]
+        example: [dbc_usage, light_board]
     container:
       image: espressif/idf:v5.5.3
     steps:
@@ -25,22 +23,18 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.ccache
-          key: ccache-${{ matrix.target }}-${{ github.sha }}
+          key: ccache-esp32c3-${{ matrix.example }}-${{ github.run_id }}
           restore-keys: |
-            ccache-${{ matrix.target }}-
+            ccache-esp32c3-${{ matrix.example }}-${{ github.ref }}
+            ccache-esp32c3-${{ matrix.example }}-
 
-      - name: Build dbc_usage example
-        working-directory: examples/dbc_usage
+      - name: Build ${{ matrix.example }} example
+        working-directory: examples/${{ matrix.example }}
+        env:
+          IDF_CCACHE_ENABLE: "1"
         run: |
           . $IDF_PATH/export.sh
-          idf.py set-target ${{ matrix.target }}
-          idf.py build
-
-      - name: Build light_board example
-        working-directory: examples/light_board
-        run: |
-          . $IDF_PATH/export.sh
-          idf.py set-target ${{ matrix.target }}
+          idf.py set-target esp32c3
           idf.py build
 
   upload_component:
@@ -51,6 +45,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          fetch-tags: true
 
       - name: Upload to ESP Component Registry
         uses: espressif/upload-components-ci-action@v2
