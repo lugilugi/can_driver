@@ -2,6 +2,11 @@ name: Publish to ESP Registry
 
 on:
   workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to publish (semver, e.g. 4.0.8)'
+        required: true
+        type: string
   push:
     tags:
       - 'v*.*.*'
@@ -47,11 +52,19 @@ jobs:
           fetch-depth: 0
           fetch-tags: true
 
+      - name: Resolve version
+        id: version
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            echo "version=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Upload to ESP Component Registry
         uses: espressif/upload-components-ci-action@v2
         with:
           namespace: "lugilugi"
           components: "can_driver:."
           api_token: "${{ secrets.IDF_COMPONENT_API_TOKEN }}"
-          # Derives the version from the git tag (e.g. v1.0.1 -> 1.0.1)
-          version: "git"
+          version: "${{ steps.version.outputs.version }}"
