@@ -1,4 +1,3 @@
-#include <stdio.h>
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -82,15 +81,16 @@ static volatile bool s_running  = false;
 // =============================================================================
 static void can_rx_task(void *arg)
 {
-    twai_message_t rx_msg;
+    uint8_t rx_buf[8];
+    twai_frame_t rx_msg = { .buffer = rx_buf, .buffer_len = sizeof(rx_buf) };
     ESP_LOGI(TAG, "CAN RX Task started.");
 
     while (1) {
         if (can_driver_receive(&rx_msg, portMAX_DELAY) == ESP_OK) {
-            if (rx_msg.identifier == NETWORK_AUX_CTRL_FRAME_ID) {
+            if (rx_msg.header.id == NETWORK_AUX_CTRL_FRAME_ID) {
                 struct network_aux_ctrl_t decoded;
                 // Parse standard TWAI frame via DBC generated code
-                network_aux_ctrl_unpack(&decoded, rx_msg.data, rx_msg.data_length_code);
+                network_aux_ctrl_unpack(&decoded, rx_msg.buffer, rx_msg.buffer_len);
 
                 // Safely update state
                 portENTER_CRITICAL(&g_aux_mux);
@@ -224,9 +224,13 @@ void app_main(void)
     ESP_ERROR_CHECK(gpio_config(&ctrl_cfg));
     gpio_set_level(CAN_STB_PIN, 0);
 
-    // Initialize TWAI Driver (Replaces old driver + manager init)
+    // Initialize TWAI Driver (Replaces old driver + manager init).
+    // Hardware filter: only AUX_CTRL (0x210) frames wake the CPU; all other
+    // bus traffic (pedal, power monitors) is dropped by the peripheral.
     CanInitFlags_t flags = {0};
-    ESP_ERROR_CHECK(can_driver_init(CAN_TX_PIN, CAN_RX_PIN, 500000, flags));
+    static const uint32_t rx_ids[] = { NETWORK_AUX_CTRL_FRAME_ID };
+    CanFilterConfig_t filter = { .ids = rx_ids, .id_count = 1 };
+    ESP_ERROR_CHECK(can_driver_init(CAN_TX_PIN, CAN_RX_PIN, 500000, flags, &filter));
 
     // Start our own RX parsing task instead of relying on the old manager!
     xTaskCreate(can_rx_task, "can_rx", 4096, NULL, 5, NULL);
@@ -270,7 +274,7 @@ void app_main(void)
             .gpio_num   = main_ch[i].pin,
             .duty       = boot_duty,
             .hpoint     = 0,
-            .flags.output_invert = 1,
+            .flags.output_invert = 0,
         };
         ESP_ERROR_CHECK(ledc_channel_config(&ch_cfg));
     }

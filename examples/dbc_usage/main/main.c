@@ -1,4 +1,3 @@
-#include <stdio.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
@@ -11,29 +10,51 @@ static const char *TAG = "can_example";
 
 void can_rx_task(void *arg)
 {
-    twai_message_t rx_msg;
-    
+    uint8_t rx_buf[8];
+    twai_frame_t rx_msg = { .buffer = rx_buf, .buffer_len = sizeof(rx_buf) };
+
     ESP_LOGI(TAG, "CAN RX Task started. Listening for frames...");
 
     while (1) {
         // Block indefinitely until a frame is received
         if (can_driver_receive(&rx_msg, portMAX_DELAY) == ESP_OK) {
-            
+
             // Switch on the ID, just like the old dispatch code, but much simpler
-            switch (rx_msg.identifier) {
+            switch (rx_msg.header.id) {
                 case NETWORK_PEDAL_FRAME_ID: {
                     struct network_pedal_t decoded_pedal;
-                    
+
                     // Use the cantools-generated unpack function!
-                    network_pedal_unpack(&decoded_pedal, rx_msg.data, rx_msg.data_length_code);
-                    
+                    network_pedal_unpack(&decoded_pedal, rx_msg.buffer, rx_msg.buffer_len);
+
                     // You can now use decoded_pedal.throttle_raw directly in your app
-                    ESP_LOGI(TAG, "Received Pedal Frame! Throttle: %d", decoded_pedal.throttle_raw);
+                    ESP_LOGI(TAG, "Received Pedal Frame! Throttle: %d, Kill: %d",
+                             decoded_pedal.throttle_raw, decoded_pedal.kill_flag);
                     break;
                 }
-                
+
+                case NETWORK_AUX_CTRL_FRAME_ID: {
+                    struct network_aux_ctrl_t decoded_aux;
+
+                    network_aux_ctrl_unpack(&decoded_aux, rx_msg.buffer, rx_msg.buffer_len);
+                    ESP_LOGI(TAG, "Received AUX Frame! Left: %d, Right: %d",
+                             decoded_aux.left_turn, decoded_aux.right_turn);
+                    break;
+                }
+
+                case NETWORK_PWR_MONITOR_780_FRAME_ID: {
+                    struct network_pwr_monitor_780_t decoded_power;
+
+                    network_pwr_monitor_780_unpack(&decoded_power, rx_msg.buffer, rx_msg.buffer_len);
+                    ESP_LOGI(TAG, "Received Power Frame! Volts: %.3f, Amps: %.3f",
+                             decoded_power.volts * 0.003125f, decoded_power.amps * 0.0024f);
+                    break;
+                }
+
                 default:
-                    // Unhandled message
+                    // With .software_filter enabled the driver only delivers
+                    // the listed IDs, so this is defensive.
+                    ESP_LOGW(TAG, "Unhandled CAN ID: 0x%lx", (unsigned long)rx_msg.header.id);
                     break;
             }
         }
@@ -44,32 +65,78 @@ void app_main(void)
 {
     ESP_LOGI(TAG, "Starting DBC Example...");
 
-    // 1. Initialize the driver (example uses 500kbps, GPIO 21 TX, GPIO 22 RX)
+    // 1. Initialize the driver (example uses 500kbps, GPIO 4 TX, GPIO 5 RX)
     // Adjust pins based on your hardware!
     CanInitFlags_t flags = { .loopback = 0, .listen_only = 0 };
-    esp_err_t err = can_driver_init(GPIO_NUM_21, GPIO_NUM_22, 500000, flags);
-    
+
+    // Accept a LIST of IDs in hardware, so unrelated bus traffic never
+    // wakes the CPU. NULL (or CAN_FILTER_ACCEPT_ALL()) accepts everything.
+    //
+    // 0x110, 0x210 and 0x310 are in different ID classes (1, 2 and 3), so
+    // no single hardware mask can accept exactly these three: the driver
+    // uses the smallest region {0x010, 0x110, 0x210, 0x310}. .software_filter
+    // makes the driver discard the extra IDs (here: 0x010) so only the
+    // listed frames are delivered. Note it does not save power — the CPU
+    // still wakes for 0x010 if anyone transmits it.
+    static const uint32_t rx_ids[] = {
+        NETWORK_PEDAL_FRAME_ID,
+        NETWORK_AUX_CTRL_FRAME_ID,
+        NETWORK_PWR_MONITOR_780_FRAME_ID,
+    };
+    CanFilterConfig_t filter = {
+        .ids = rx_ids,
+        .id_count = 3,
+        .software_filter = 1,
+    };
+    esp_err_t err = can_driver_init(GPIO_NUM_4, GPIO_NUM_5, 500000, flags, &filter);
+
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to init CAN driver");
+        ESP_LOGE(TAG, "Failed to init CAN driver: %s", esp_err_to_name(err));
         return;
     }
 
     // 2. Start the RX processing task
     xTaskCreate(can_rx_task, "can_rx_task", 4096, NULL, 5, NULL);
 
-    // 3. (Optional) Example of transmitting with timeout handling
-    // This solves the old ESP_ERR_NO_MEM buffer issue!
-    uint8_t dummy_payload[8] = {0};
-    
+    // 3. Example of building a frame with a cantools-generated pack() and
+    //    transmitting it. The driver copies the frame into its own TX slots,
+    //    so a stack buffer is fine.
+    struct network_dash_stat_t dash_stat = { 0 };
+    network_dash_stat_init(&dash_stat);
+
+    uint8_t payload[8];
+    int payload_len = network_dash_stat_pack(payload, &dash_stat, sizeof(payload));
+
+    twai_frame_t tx_msg = {
+        .header.id = NETWORK_DASH_STAT_FRAME_ID,
+        .buffer = payload,
+        .buffer_len = payload_len,   // dlc is derived from buffer_len automatically
+    };
+
     // Block for up to 50ms (pdMS_TO_TICKS(50)) waiting for space in the TX queue.
-    if (can_driver_transmit(0x400, dummy_payload, 8, pdMS_TO_TICKS(50)) != ESP_OK) {
+    if (can_driver_transmit(&tx_msg, pdMS_TO_TICKS(50)) != ESP_OK) {
         ESP_LOGW(TAG, "TX Queue full, dropped frame after 50ms timeout");
     } else {
         ESP_LOGI(TAG, "Transmitted frame successfully");
     }
 
-    // Task loops indefinitely
+    // Task loops indefinitely, printing diagnostics every 5 seconds
+    int tick = 0;
     while(1) {
         vTaskDelay(pdMS_TO_TICKS(1000));
+
+        if (++tick % 5 == 0) {
+            CanStatus_t status;
+            if (can_driver_get_status(&status) == ESP_OK) {
+                ESP_LOGI(TAG, "state=%d TXerr=%u RXerr=%u TXq=%lu RXq=%lu bus_errs=%lu dropped=%lu sw_dropped=%lu",
+                         status.error_state,
+                         status.tx_error_count, status.rx_error_count,
+                         (unsigned long)status.tx_queue_remaining,
+                         (unsigned long)status.rx_queue_remaining,
+                         (unsigned long)status.bus_error_count,
+                         (unsigned long)status.rx_dropped_count,
+                         (unsigned long)status.software_dropped_count);
+            }
+        }
     }
 }

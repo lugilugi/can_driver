@@ -69,3 +69,12 @@ BO_ 1024 DASH_STAT: 8 Dashboard
  SG_ data : 0|64@1+ (1,0) [0|1.844674407E+019] ""  MotorController
 
 CM_ "DBC file auto-generated from legacy can_payloads.h";
+
+CM_ BO_ 272 "Class 1 (pedal/safety): single PEDAL frame, index 0x10.";
+CM_ BO_ 528 "Class 2 (aux control): single AUX_CTRL frame, index 0x10.";
+CM_ BO_ 784 "Class 3 (power monitoring): PWR_MONITOR_780, index 0x10.";
+CM_ BO_ 785 "Class 3 (power monitoring): PWR_MONITOR_740, index 0x11.";
+CM_ BO_ 786 "Class 3 (power monitoring): PWR_ENERGY, index 0x12.";
+CM_ BO_ 1024 "Class 4 (dashboard): single DASH_STAT frame, index 0x00.";
+
+CM_ "CAN ID convention (11-bit standard IDs, mask-friendly): bits 10..8 = class (3 bits: 0x0 reserved, 0x1 pedal/safety, 0x2 aux, 0x3 power monitoring, 0x4 dashboard, 0x5..0x7 future); bits 7..0 = message index (8 bits, 256 per class, contiguous). Rules: new messages stay in their sender's class with the next free index; a new domain gets the next unused class. Receiving a whole class is an exact hardware mask (code C<<8, mask 0x700); receiving across classes requires can_driver's .software_filter.";
