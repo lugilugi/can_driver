@@ -8,9 +8,11 @@ set(can_srcs
 )
 
 set(can_requires
-    driver
     esp_driver_twai
     freertos
+)
+
+set(can_private_requires
     log
 )
 
@@ -21,4 +23,6 @@ idf_component_register(
         "include"
     REQUIRES
         ${can_requires}
+    PRIV_REQUIRES
+        ${can_private_requires}
 )

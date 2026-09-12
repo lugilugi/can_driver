@@ -17,15 +17,21 @@ void can_rx_task(void *arg)
 
     while (1) {
         // Block indefinitely until a frame is received
-        if (can_driver_receive(&rx_msg, portMAX_DELAY) == ESP_OK) {
+        esp_err_t rx_err = can_driver_receive(&rx_msg, sizeof(rx_buf), portMAX_DELAY);
+        if (rx_err == ESP_OK) {
 
             // Switch on the ID, just like the old dispatch code, but much simpler
             switch (rx_msg.header.id) {
                 case NETWORK_PEDAL_FRAME_ID: {
-                    struct network_pedal_t decoded_pedal;
+                    struct network_pedal_t decoded_pedal = {0};
 
-                    // Use the cantools-generated unpack function!
-                    network_pedal_unpack(&decoded_pedal, rx_msg.buffer, rx_msg.buffer_len);
+                    if (rx_msg.buffer_len != NETWORK_PEDAL_LENGTH ||
+                        network_pedal_unpack(&decoded_pedal, rx_msg.buffer,
+                                             rx_msg.buffer_len) != 0) {
+                        ESP_LOGW(TAG, "Invalid PEDAL frame length: %u",
+                                 (unsigned)rx_msg.buffer_len);
+                        break;
+                    }
 
                     // You can now use decoded_pedal.throttle_raw directly in your app
                     ESP_LOGI(TAG, "Received Pedal Frame! Throttle: %d, Kill: %d",
@@ -34,18 +40,30 @@ void can_rx_task(void *arg)
                 }
 
                 case NETWORK_AUX_CTRL_FRAME_ID: {
-                    struct network_aux_ctrl_t decoded_aux;
+                    struct network_aux_ctrl_t decoded_aux = {0};
 
-                    network_aux_ctrl_unpack(&decoded_aux, rx_msg.buffer, rx_msg.buffer_len);
+                    if (rx_msg.buffer_len != NETWORK_AUX_CTRL_LENGTH ||
+                        network_aux_ctrl_unpack(&decoded_aux, rx_msg.buffer,
+                                                rx_msg.buffer_len) != 0) {
+                        ESP_LOGW(TAG, "Invalid AUX_CTRL frame length: %u",
+                                 (unsigned)rx_msg.buffer_len);
+                        break;
+                    }
                     ESP_LOGI(TAG, "Received AUX Frame! Left: %d, Right: %d",
                              decoded_aux.left_turn, decoded_aux.right_turn);
                     break;
                 }
 
                 case NETWORK_PWR_MONITOR_780_FRAME_ID: {
-                    struct network_pwr_monitor_780_t decoded_power;
+                    struct network_pwr_monitor_780_t decoded_power = {0};
 
-                    network_pwr_monitor_780_unpack(&decoded_power, rx_msg.buffer, rx_msg.buffer_len);
+                    if (rx_msg.buffer_len != NETWORK_PWR_MONITOR_780_LENGTH ||
+                        network_pwr_monitor_780_unpack(&decoded_power, rx_msg.buffer,
+                                                       rx_msg.buffer_len) != 0) {
+                        ESP_LOGW(TAG, "Invalid PWR_MONITOR_780 frame length: %u",
+                                 (unsigned)rx_msg.buffer_len);
+                        break;
+                    }
                     ESP_LOGI(TAG, "Received Power Frame! Volts: %.3f, Amps: %.3f",
                              decoded_power.volts * 0.003125f, decoded_power.amps * 0.0024f);
                     break;
@@ -57,6 +75,8 @@ void can_rx_task(void *arg)
                     ESP_LOGW(TAG, "Unhandled CAN ID: 0x%lx", (unsigned long)rx_msg.header.id);
                     break;
             }
+        } else if (rx_err != ESP_ERR_TIMEOUT) {
+            ESP_LOGW(TAG, "CAN receive failed: %s", esp_err_to_name(rx_err));
         }
     }
 }
@@ -96,7 +116,10 @@ void app_main(void)
     }
 
     // 2. Start the RX processing task
-    xTaskCreate(can_rx_task, "can_rx_task", 4096, NULL, 5, NULL);
+    if (xTaskCreate(can_rx_task, "can_rx_task", 4096, NULL, 5, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create CAN RX task");
+        return;
+    }
 
     // 3. Example of building a frame with a cantools-generated pack() and
     //    transmitting it. The driver copies the frame into its own TX slots,
@@ -106,6 +129,10 @@ void app_main(void)
 
     uint8_t payload[8];
     int payload_len = network_dash_stat_pack(payload, &dash_stat, sizeof(payload));
+    if (payload_len < 0) {
+        ESP_LOGE(TAG, "Failed to pack DASH_STAT: %d", payload_len);
+        return;
+    }
 
     twai_frame_t tx_msg = {
         .header.id = NETWORK_DASH_STAT_FRAME_ID,
@@ -128,14 +155,17 @@ void app_main(void)
         if (++tick % 5 == 0) {
             CanStatus_t status;
             if (can_driver_get_status(&status) == ESP_OK) {
-                ESP_LOGI(TAG, "state=%d TXerr=%u RXerr=%u TXq=%lu RXq=%lu bus_errs=%lu dropped=%lu sw_dropped=%lu",
+                ESP_LOGI(TAG, "state=%d TXslots=%lu TWAI_TXq=%lu RXq=%lu TXerr=%u RXerr=%u bus_errs=%lu dropped=%lu sw_dropped=%lu malformed=%lu recovery_failures=%lu",
                          status.error_state,
-                         status.tx_error_count, status.rx_error_count,
-                         (unsigned long)status.tx_queue_remaining,
+                         (unsigned long)status.tx_slots_remaining,
+                         (unsigned long)status.twai_tx_queue_remaining,
                          (unsigned long)status.rx_queue_remaining,
+                         status.tx_error_count, status.rx_error_count,
                          (unsigned long)status.bus_error_count,
                          (unsigned long)status.rx_dropped_count,
-                         (unsigned long)status.software_dropped_count);
+                         (unsigned long)status.software_dropped_count,
+                         (unsigned long)status.malformed_frame_count,
+                         (unsigned long)status.recovery_failure_count);
             }
         }
     }

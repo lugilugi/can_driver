@@ -86,11 +86,18 @@ static void can_rx_task(void *arg)
     ESP_LOGI(TAG, "CAN RX Task started.");
 
     while (1) {
-        if (can_driver_receive(&rx_msg, portMAX_DELAY) == ESP_OK) {
+        esp_err_t rx_err = can_driver_receive(&rx_msg, sizeof(rx_buf), portMAX_DELAY);
+        if (rx_err == ESP_OK) {
             if (rx_msg.header.id == NETWORK_AUX_CTRL_FRAME_ID) {
-                struct network_aux_ctrl_t decoded;
+                struct network_aux_ctrl_t decoded = {0};
                 // Parse standard TWAI frame via DBC generated code
-                network_aux_ctrl_unpack(&decoded, rx_msg.buffer, rx_msg.buffer_len);
+                if (rx_msg.buffer_len != NETWORK_AUX_CTRL_LENGTH ||
+                    network_aux_ctrl_unpack(&decoded, rx_msg.buffer,
+                                            rx_msg.buffer_len) != 0) {
+                    ESP_LOGW(TAG, "Invalid AUX_CTRL frame length: %u",
+                             (unsigned)rx_msg.buffer_len);
+                    continue;
+                }
 
                 // Safely update state
                 portENTER_CRITICAL(&g_aux_mux);
@@ -98,6 +105,8 @@ static void can_rx_task(void *arg)
                 g_last_aux_tick = xTaskGetTickCount();
                 portEXIT_CRITICAL(&g_aux_mux);
             }
+        } else if (rx_err != ESP_ERR_TIMEOUT) {
+            ESP_LOGW(TAG, "CAN receive failed: %s", esp_err_to_name(rx_err));
         }
     }
 }
@@ -233,7 +242,10 @@ void app_main(void)
     ESP_ERROR_CHECK(can_driver_init(CAN_TX_PIN, CAN_RX_PIN, 500000, flags, &filter));
 
     // Start our own RX parsing task instead of relying on the old manager!
-    xTaskCreate(can_rx_task, "can_rx", 4096, NULL, 5, NULL);
+    if (xTaskCreate(can_rx_task, "can_rx", 4096, NULL, 5, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create CAN RX task");
+        return;
+    }
 
     // Turn-signal GPIO
     const gpio_num_t signal_pins[] = { LIGHT_PIN_LEFT_SIGNAL, LIGHT_PIN_RIGHT_SIGNAL };

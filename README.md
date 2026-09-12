@@ -2,6 +2,10 @@
 
 This component provides a lightweight CAN (TWAI) wrapper for ESP-IDF, specifically tailored to work seamlessly with `cantools` auto-generated DBC parsers. It is built on the modern ESP-IDF 5.5 `esp_driver_twai` node API (callback-driven, no polling).
 
+The component supports classic CAN only. CAN-FD frames are excluded from the
+hardware acceptance filter and rejected by the transmit/receive validation;
+the eight-byte payload storage is intentional and is not a CAN-FD buffer.
+
 ## Architecture
 
 This component consists of a thin driver layer that abstracts away the complex TWAI setup, and generated message parsers based on your DBC specification:
@@ -9,15 +13,15 @@ This component consists of a thin driver layer that abstracts away the complex T
   - **Hardware ID-list filtering**: accept a list of IDs; non-matching frames never wake the CPU. The driver computes the smallest maskable region containing the list.
   - **Software filtering (opt-in)**: `.software_filter` discards frames the hardware region over-accepts, so only the listed IDs are delivered.
   - **Callback-driven RX**: matching frames wake the CPU and are queued by the driver — no polling, no busy loops.
-  - **Automatic bus-off recovery** via the driver's state-change callback.
+  - **Automatic bus-off recovery** requested by the state-change ISR and performed in the FreeRTOS timer-service task.
   - **Diagnostics**: error counters, queue depth, bus error count (`can_driver_get_status`).
-  - **Safe TX slots**: the driver copies frames into its own TX pool, so callers can use stack-allocated frames and buffers.
+  - **Safe TX slots**: the driver copies frames into its own TX pool, so callers can use stack-allocated frames and buffers. Slot ownership is transferred through a bounded free-slot queue.
 - **`network.c` / `network.h`**: Auto-generated from `network.dbc` using `cantools`. This provides typed structures and unpack/pack functions for handling specific CAN network messages.
 
 ## Requirements
 
 - **ESP-IDF**: >= 5.5.3 (uses the `esp_driver_twai` node API)
-- **Hardware**: Any ESP32 series chip that features the TWAI (Two-Wire Automotive Interface) controller (e.g. ESP32, ESP32-S2, ESP32-S3, ESP32-C3).
+- **Hardware**: Any ESP32 series chip that features the classic TWAI controller (e.g. ESP32, ESP32-S2, ESP32-S3, ESP32-C3). On CAN-FD-capable targets this component still operates in classic-CAN-only mode.
 - **External Transceiver**: A 3.3V compatible CAN transceiver is required to connect to a physical CAN bus.
 
 ## Example Usage
@@ -38,7 +42,7 @@ CanInitFlags_t flags = { .loopback = 0, .listen_only = 0 };
 static const uint32_t rx_ids[] = { NETWORK_PEDAL_FRAME_ID, NETWORK_AUX_CTRL_FRAME_ID };
 CanFilterConfig_t filter = { .ids = rx_ids, .id_count = 2 };
 
-// NULL or CAN_FILTER_ACCEPT_ALL() accepts everything
+// NULL or CAN_FILTER_ACCEPT_ALL() accepts every classic-CAN frame
 esp_err_t err = can_driver_init(GPIO_NUM_4, GPIO_NUM_5, 500000, flags, &filter);
 if (err != ESP_OK) {
     // Handle error
@@ -66,7 +70,7 @@ CanFilterConfig_t filter = {
 ```
 
 > [!NOTE]
-> The acceptance filter can only target one ID format at a time: standard *or* extended (`filter.extd`). With accept-all + `.software_filter`, frames of the other format are also discarded.
+> The acceptance filter can only target one ID format at a time: standard *or* extended (`filter.extd`). With hardware accept-all + `.software_filter`, the hardware accepts both formats but the software whitelist matches only the format selected by `filter.extd`. All nonzero ID lists must be unique, in range, and have a valid `ids` pointer.
 
 > [!WARNING]
 > Be sure to specify the correct `GPIO_NUM_xx` pins corresponding to your specific ESP32 target. For example, ESP32-C3 has no `GPIO_NUM_22` (GPIO range is 0..21, with 18/19 used for USB) — the examples use GPIO 4/5 for CAN TX/RX. Make sure to update the pin constants in your code.
@@ -80,15 +84,20 @@ Using the included auto-generated `cantools` code (`network.h`), parsing frames 
 
 uint8_t rx_buf[8];
 twai_frame_t rx_msg = { .buffer = rx_buf, .buffer_len = sizeof(rx_buf) };
+const size_t rx_capacity = sizeof(rx_buf);
 
 // Wait for a message (blocks until one is received)
-if (can_driver_receive(&rx_msg, portMAX_DELAY) == ESP_OK) {
+if (can_driver_receive(&rx_msg, rx_capacity, portMAX_DELAY) == ESP_OK) {
     switch (rx_msg.header.id) {
         case NETWORK_PEDAL_FRAME_ID: {
-            struct network_pedal_t decoded_pedal;
+            struct network_pedal_t decoded_pedal = { 0 };
 
-            // Unpack the raw data payload into the strongly typed struct
-            network_pedal_unpack(&decoded_pedal, rx_msg.buffer, rx_msg.buffer_len);
+            // Check the DBC-defined length and unpack result before use.
+            if (rx_msg.buffer_len != NETWORK_PEDAL_LENGTH ||
+                network_pedal_unpack(&decoded_pedal, rx_msg.buffer,
+                                     rx_msg.buffer_len) != 0) {
+                break;
+            }
 
             printf("Received Pedal Throttle: %d\n", decoded_pedal.throttle_raw);
             break;
@@ -132,20 +141,25 @@ CanStatus_t status;
 if (can_driver_get_status(&status) == ESP_OK) {
     // status.error_state (active/warning/passive/bus_off)
     // status.tx_error_count, status.rx_error_count
-    // status.tx_queue_remaining, status.rx_queue_remaining
+    // status.tx_slots_remaining (driver slots)
+    // status.twai_tx_queue_remaining (native ESP-IDF queue)
+    // status.rx_queue_remaining
     // status.bus_error_count, status.rx_dropped_count
     // status.software_dropped_count (frames discarded by .software_filter)
+    // status.malformed_frame_count, status.recovery_failure_count
 }
 ```
 
-`bus_error_count` counts `on_error` events (bit errors, form errors, stuff errors, etc.) since the node was enabled; `rx_dropped_count` counts frames lost because the RX queue (depth 8) was full; `software_dropped_count` counts frames discarded by the software filter. All are cheap counters you can poll from a low-rate monitoring task.
+`bus_error_count` counts `on_error` events (bit errors, form errors, stuff errors, etc.) since the node was enabled; it is maintained by the wrapper so automatic recovery does not reset its lifetime. `rx_dropped_count` counts frames lost because the RX queue (depth 8) was full; `software_dropped_count` counts frames discarded by the software filter; `malformed_frame_count` counts rejected FD/invalid-DLC frames; and `recovery_failure_count` counts failures to schedule or complete deferred bus-off recovery. All are cheap counters you can poll from a low-rate monitoring task.
+
+`can_driver_receive()` consumes a queued frame and returns `ESP_ERR_INVALID_SIZE` if the explicit destination capacity is too small. It reports the required length in `frame->buffer_len` and performs no partial copy.
 
 ### 5. Testing in Loopback (no transceiver needed)
 
 ```c
 CanInitFlags_t flags = { .loopback = 1, .listen_only = 0 };
-// On classic chips (ESP32-C3) loopback requires self-test mode, which the
-// driver enables automatically when .loopback is set.
+// Loopback is classic-CAN loopback; the driver enables self-test mode when
+// .loopback is set. CAN-FD loopback is not supported.
 can_driver_init(GPIO_NUM_4, GPIO_NUM_5, 500000, flags, NULL);
 ```
 
@@ -156,6 +170,7 @@ In loopback mode, every frame you transmit is also received by the same node —
 - The acceptance filter is the main power lever: only matching frames generate an interrupt, so the CPU stays asleep between relevant frames even on a busy bus.
 - RX is interrupt-driven (no polling task in the driver), and the driver spawns no background tasks.
 - While the node is enabled it holds a PM lock (APB frequency / light-sleep constraint on some targets). Call `can_driver_deinit()` before entering light sleep to release it, then `can_driver_init()` again to resume; the transceiver standby pin (e.g. STB) can be driven alongside this for further savings.
+- Stop and join all tasks using the driver before calling `can_driver_deinit()`. Init/deinit must be externally serialized with transmit, receive, and status calls; the driver rejects teardown while an operation is active.
 
 ```c
 // Before entering light sleep
