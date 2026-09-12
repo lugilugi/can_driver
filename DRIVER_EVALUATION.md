@@ -245,7 +245,7 @@ For the ESP32-C3 32-bit ABI represented by the component's ESP-IDF 5.5.3 build c
 
 The RX queue and semaphore also allocate FreeRTOS control metadata, and each `calloc()` has allocator metadata/alignment cost not shown above. ESP-IDF independently allocates its node context, native pointer queue, event group, interrupt handle, and optional PM lock.
 
-The generated decoded structures are naturally compact: byte-sized boolean signals are stored as `uint8_t`, monitor readings as 16-bit integers, and only the 40-bit energy and 64-bit dashboard fields use `uint64_t`. Packing `network_aux_ctrl_t` into C bitfields could save six bytes per live decoded object but would introduce implementation-defined layout and less convenient access. The application holds only a few such objects; this micro-optimization is not justified.
+The generated decoded structures are naturally compact: byte-sized boolean signals are stored as `uint8_t`, monitor readings as 16-bit integers, GPS coordinates use signed 32-bit integers, and the 40-bit energy field uses `uint64_t`. Packing `network_aux_command_t` into C bitfields could save six bytes per live decoded object but would introduce implementation-defined layout and less convenient access. The application holds only a few such objects; this micro-optimization is not justified.
 
 ### Heap behavior
 
@@ -267,7 +267,7 @@ RX payload follows an unavoidable decoupling path: HAL buffer to ISR-owned snaps
 
 ### 64-bit and floating-point work
 
-`uint64_t` in `network_pwr_energy_t` is required for a 40-bit wire signal, and `uint64_t` in `network_dash_stat_t` is required for a 64-bit signal. Their pack/unpack shifts are protocol-driven and should remain.
+`uint64_t` in `network_pack_energy_t` is required for the 40-bit wire signal. The signed 32-bit GPS coordinates and 32-bit trip distance are also protocol-driven. Their pack/unpack shifts are required and should remain.
 
 Cantools also generated `double` physical encode/decode/range functions for every signal. On a 32-bit target without efficient double precision, calling these can increase flash and CPU cost, especially for division in the power conversions. They allocate no memory and unused function sections can be removed by the linker. Applications that need minimum latency should use raw fields or measured fixed-point helpers at the application boundary; generated files should not be hand-edited. The `double` API is useful protocol conversion, not arbitrary driver overhead.
 

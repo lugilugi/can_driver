@@ -1,222 +1,243 @@
-# CAN Driver (ESP-IDF TWAI)
+# CAN Driver (ESP-IDF TWAI) — v5.0.0
 
-This component provides a lightweight CAN (TWAI) wrapper for ESP-IDF, specifically tailored to work seamlessly with `cantools` auto-generated DBC parsers. It is built on the modern ESP-IDF 5.5 `esp_driver_twai` node API (callback-driven, no polling).
+This component provides a bounded, callback-driven wrapper around the ESP-IDF
+5.5.3 `esp_driver_twai` node API and the ECT2026 CAN V5 protocol bindings.
 
-The component supports classic CAN only. CAN-FD frames are excluded from the
-hardware acceptance filter and rejected by the transmit/receive validation;
-the eight-byte payload storage is intentional and is not a CAN-FD buffer.
+The V5 protocol is a breaking release. The DBC source of truth is
+`network.dbc`, and the checked-in `network.c` / `include/network.h` files
+are generated with cantools 41.4.3.
+
+## Protocol contract
+
+ECT2026_CAN_V5 is intentionally:
+
+- Classical CAN only; CAN-FD frames are rejected by the driver.
+- Standard 11-bit identifiers.
+- Intended for a 500 kbit/s bus.
+- Little-endian signal encoding.
+- Bounded to eight-byte payloads.
+
+| ID | Message | Bytes | Sender | Cycle metadata |
+| ---: | --- | ---: | --- | ---: |
+| 0x110 | PEDAL_STATUS | 6 | PDLB | 20 ms |
+| 0x210 | AUX_COMMAND | 1 | STER | 100 ms |
+| 0x310 | PACK_POWER | 4 | JBOX | 100 ms |
+| 0x311 | AUX_POWER | 4 | JBOX | 100 ms |
+| 0x312 | PACK_ENERGY | 5 | JBOX | 5000 ms |
+| 0x400 | VEHICLE_MOTION | 8 | TELE | 100 ms |
+| 0x401 | VEHICLE_TIME | 7 | TELE | 1000 ms |
+| 0x410 | GPS_STATUS | 4 | TELE | 1000 ms |
+| 0x411 | GPS_POSITION | 8 | TELE | 200 ms |
+| 0x412 | GPS_MOTION | 4 | TELE | 200 ms |
+| 0x600 | MOTOR_STATE | 8 | IMC | 50 ms |
+| 0x601 | MOTOR_CURRENT | 6 | IMC | 20 ms |
+| 0x602 | MOTOR_VOLTAGE | 6 | IMC | 50 ms |
+| 0x603 | MOTOR_FAULTS | 8 | IMC | 100 ms |
+| 0x604 | MOTOR_ESTIMATOR | 8 | IMC | 20 ms |
+| 0x605 | MOTOR_PHASE_CURRENT | 6 | IMC | 0 |
+
+A cycle value of zero means that no periodic transmission is prescribed. It
+does not request continuous transmission or transmission on every scheduler
+iteration. The driver never schedules protocol messages.
+
+Application firmware owns policy such as:
+
+- Forcing `throttle_command` to zero while `throttle_inhibit` is asserted.
+- Treating `inhibit_reason` values 6–15 as reserved/invalid.
+- Enforcing message freshness and sequence-counter policy.
+- Interpreting GPS validity flags.
+- Selecting safe outputs when safety inputs become stale.
+
+The auxiliary command message reserves bits 2 and 7. Brake-lamp control uses
+`PEDAL_STATUS.brake_active`, not an auxiliary command signal.
 
 ## Architecture
 
-This component consists of a thin driver layer that abstracts away the complex TWAI setup, and generated message parsers based on your DBC specification:
-- **`can_driver`**: A wrapper to safely initialize the TWAI peripheral, queue transmissions, and receive messages cleanly. Features:
-  - **Hardware ID-list filtering**: accept a list of IDs; non-matching frames never wake the CPU. The driver computes the smallest maskable region containing the list.
-  - **Software filtering (opt-in)**: `.software_filter` discards frames the hardware region over-accepts, so only the listed IDs are delivered.
-  - **Callback-driven RX**: matching frames wake the CPU and are queued by the driver — no polling, no busy loops.
-  - **Automatic bus-off recovery** requested by the state-change ISR and performed in the FreeRTOS timer-service task.
-  - **Diagnostics**: error counters, queue depth, bus error count (`can_driver_get_status`).
-  - **Safe TX slots**: the driver copies frames into its own TX pool, so callers can use stack-allocated frames and buffers. Slot ownership is transferred through a bounded free-slot queue.
-- **`network.c` / `network.h`**: Auto-generated from `network.dbc` using `cantools`. This provides typed structures and unpack/pack functions for handling specific CAN network messages.
+The component contains two layers:
+
+- **`can_driver`**: TWAI setup, hardware/software filtering, bounded RX
+  delivery, driver-owned TX slots, deferred bus-off recovery, and diagnostics.
+- **Generated protocol bindings**: typed raw-value structures plus pack/unpack
+  and physical conversion functions derived from `network.dbc`.
+
+The driver has one singleton instance, no driver-owned task, no per-frame heap
+allocation, and fixed-depth queues. Callers must stop and join all tasks using
+the driver before deinitializing it.
 
 ## Requirements
 
-- **ESP-IDF**: >= 5.5.3 (uses the `esp_driver_twai` node API)
-- **Hardware**: Any ESP32 series chip that features the classic TWAI controller (e.g. ESP32, ESP32-S2, ESP32-S3, ESP32-C3). On CAN-FD-capable targets this component still operates in classic-CAN-only mode.
-- **External Transceiver**: A 3.3V compatible CAN transceiver is required to connect to a physical CAN bus.
+- ESP-IDF >= 5.5.3.
+- An ESP32-family target with the classic TWAI controller.
+- A compatible external CAN transceiver for physical-bus operation.
 
-## Example Usage
+CAN-FD-capable targets may be used, but this component remains classic-CAN-only.
 
-See `examples/dbc_usage` for a complete working example (multi-ID filtering, DBC decode, TX, diagnostics).
+## Example usage
 
-### 1. Initializing the Driver
+### Initialize and filter
 
 ```c
 #include "can_driver.h"
-
-// Set up the ESP32 TWAI driver using your board's TX and RX pins
-// e.g., GPIO 4 for TX, GPIO 5 for RX at 500 kbps (ESP32-C3)
-CanInitFlags_t flags = { .loopback = 0, .listen_only = 0 };
-
-// Accept only the frames this node cares about (here: PEDAL and AUX_CTRL).
-// Other frames are dropped in hardware and never wake the CPU.
-static const uint32_t rx_ids[] = { NETWORK_PEDAL_FRAME_ID, NETWORK_AUX_CTRL_FRAME_ID };
-CanFilterConfig_t filter = { .ids = rx_ids, .id_count = 2 };
-
-// NULL or CAN_FILTER_ACCEPT_ALL() accepts every classic-CAN frame
-esp_err_t err = can_driver_init(GPIO_NUM_4, GPIO_NUM_5, 500000, flags, &filter);
-if (err != ESP_OK) {
-    // Handle error
-}
-```
-
-#### How the filter behaves
-
-At boot the driver logs what it configured:
-
-| Log line | Meaning |
-|----------|---------|
-| `filter: N IDs accepted exactly (code 0x..., mask 0x...)` | The list forms one exact maskable region — optimal |
-| `filter: ... also accepts N extra IDs — set .software_filter to discard them` | One region covering the list plus N unwanted IDs. The CPU will wake for those; set `.software_filter` to prevent delivery |
-
-```c
-// Exact delivery: the driver discards over-accepted frames in the ISR.
-// Only the listed IDs are ever delivered. (Power note: the CPU still wakes
-// for every frame the hardware region accepts — this is an exactness fix.)
-CanFilterConfig_t filter = {
-    .ids = rx_ids,
-    .id_count = 2,
-    .software_filter = 1,
-};
-```
-
-> [!NOTE]
-> The acceptance filter can only target one ID format at a time: standard *or* extended (`filter.extd`). With hardware accept-all + `.software_filter`, the hardware accepts both formats but the software whitelist matches only the format selected by `filter.extd`. All nonzero ID lists must be unique, in range, and have a valid `ids` pointer.
-
-> [!WARNING]
-> Be sure to specify the correct `GPIO_NUM_xx` pins corresponding to your specific ESP32 target. For example, ESP32-C3 has no `GPIO_NUM_22` (GPIO range is 0..21, with 18/19 used for USB) — the examples use GPIO 4/5 for CAN TX/RX. Make sure to update the pin constants in your code.
-
-### 2. Receiving and Decoding Frames
-
-Using the included auto-generated `cantools` code (`network.h`), parsing frames becomes straightforward:
-
-```c
 #include "network.h"
 
+CanInitFlags_t flags = {
+    .loopback = 0,
+    .listen_only = 0,
+};
+
+static const uint32_t rx_ids[] = {
+    NETWORK_PEDAL_STATUS_FRAME_ID,
+    NETWORK_AUX_COMMAND_FRAME_ID,
+};
+
+CanFilterConfig_t filter = {
+    .ids = rx_ids,
+    .id_count = sizeof(rx_ids) / sizeof(rx_ids[0]),
+    .software_filter = 1,
+};
+
+esp_err_t err = can_driver_init(GPIO_NUM_4,
+                                GPIO_NUM_5,
+                                500000,
+                                flags,
+                                &filter);
+```
+
+A single classic-CAN hardware mask can cover a region, not an arbitrary list.
+When the list spans multiple regions, `.software_filter = 1` ensures that
+only the requested IDs are delivered after hardware acceptance.
+
+### Receive and decode
+
+The receive buffer capacity is explicit and remains valid across calls:
+
+```c
 uint8_t rx_buf[8];
-twai_frame_t rx_msg = { .buffer = rx_buf, .buffer_len = sizeof(rx_buf) };
-const size_t rx_capacity = sizeof(rx_buf);
+twai_frame_t rx_msg = {
+    .buffer = rx_buf,
+    .buffer_len = sizeof(rx_buf),
+};
 
-// Wait for a message (blocks until one is received)
-if (can_driver_receive(&rx_msg, rx_capacity, portMAX_DELAY) == ESP_OK) {
-    switch (rx_msg.header.id) {
-        case NETWORK_PEDAL_FRAME_ID: {
-            struct network_pedal_t decoded_pedal = { 0 };
+if (can_driver_receive(&rx_msg, sizeof(rx_buf), portMAX_DELAY) == ESP_OK) {
+    if (rx_msg.header.id == NETWORK_PEDAL_STATUS_FRAME_ID &&
+        rx_msg.buffer_len == NETWORK_PEDAL_STATUS_LENGTH) {
+        struct network_pedal_status_t decoded = {0};
 
-            // Check the DBC-defined length and unpack result before use.
-            if (rx_msg.buffer_len != NETWORK_PEDAL_LENGTH ||
-                network_pedal_unpack(&decoded_pedal, rx_msg.buffer,
-                                     rx_msg.buffer_len) != 0) {
-                break;
-            }
-
-            printf("Received Pedal Throttle: %d\n", decoded_pedal.throttle_raw);
-            break;
+        if (network_pedal_status_unpack(&decoded,
+                                        rx_msg.buffer,
+                                        rx_msg.buffer_len) == 0) {
+            // Apply application-level inhibit, freshness, and safety policy.
         }
-        default:
-            // If the driver logged an over-acceptance warning at boot,
-            // handle (or discard) the extra IDs here.
-            break;
     }
 }
 ```
 
-### 3. Transmitting Frames
+A received frame with a payload larger than the supplied capacity is consumed
+and returns `ESP_ERR_INVALID_SIZE`; no partial payload is copied.
+
+### Pack and transmit
+
+Generated structures contain raw integer signal values. Use generated
+`*_encode()` helpers when converting physical values:
 
 ```c
-// Build a frame with a cantools-generated pack() function
-struct network_dash_stat_t dash_stat = { 0 };
-network_dash_stat_init(&dash_stat);
-
-uint8_t payload[8];
-int payload_len = network_dash_stat_pack(payload, &dash_stat, sizeof(payload));
-
-// The driver copies the frame into its own TX slots, so a stack buffer is safe.
-// If you leave .header.dlc at 0 it is derived from buffer_len.
-twai_frame_t tx_msg = {
-    .header.id = NETWORK_DASH_STAT_FRAME_ID,
-    .buffer = payload,
-    .buffer_len = payload_len,
+struct network_vehicle_motion_t motion = {
+    .speed_kmh = 1234,       // 12.34 km/h
+    .trip_distance_m = 2500, // 250.0 m
+    .motion_valid =
+        NETWORK_VEHICLE_MOTION_MOTION_VALID_VALID_CHOICE,
+    .seq_counter = 1,
 };
 
-// Transmit onto the CAN bus, timeout of 50ms if TX queue is full
-if (can_driver_transmit(&tx_msg, pdMS_TO_TICKS(50)) == ESP_OK) {
-    printf("Successfully sent frame\n");
+uint8_t payload[8];
+int payload_len = network_vehicle_motion_pack(payload,
+                                               &motion,
+                                               sizeof(payload));
+
+twai_frame_t tx_msg = {
+    .header.id = NETWORK_VEHICLE_MOTION_FRAME_ID,
+    .buffer = payload,
+    .buffer_len = (size_t)payload_len,
+};
+
+if (payload_len == NETWORK_VEHICLE_MOTION_LENGTH &&
+    can_driver_transmit(&tx_msg, pdMS_TO_TICKS(50)) == ESP_OK) {
+    // Queued successfully.
 }
 ```
 
-### 4. Diagnostics
+The driver copies the descriptor and payload into a stable TX slot, so stack
+storage is safe after the transmit call returns.
+
+### Diagnostics
 
 ```c
 CanStatus_t status;
+
 if (can_driver_get_status(&status) == ESP_OK) {
-    // status.error_state (active/warning/passive/bus_off)
-    // status.tx_error_count, status.rx_error_count
-    // status.tx_slots_remaining (driver slots)
-    // status.twai_tx_queue_remaining (native ESP-IDF queue)
+    // status.error_state
+    // status.tx_slots_remaining
+    // status.twai_tx_queue_remaining
     // status.rx_queue_remaining
-    // status.bus_error_count, status.rx_dropped_count
-    // status.software_dropped_count (frames discarded by .software_filter)
-    // status.malformed_frame_count, status.recovery_failure_count
+    // status.bus_error_count
+    // status.rx_dropped_count
+    // status.software_dropped_count
+    // status.malformed_frame_count
+    // status.recovery_failure_count
 }
 ```
 
-`bus_error_count` counts `on_error` events (bit errors, form errors, stuff errors, etc.) since the node was enabled; it is maintained by the wrapper so automatic recovery does not reset its lifetime. `rx_dropped_count` counts frames lost because the RX queue (depth 8) was full; `software_dropped_count` counts frames discarded by the software filter; `malformed_frame_count` counts rejected FD/invalid-DLC frames; and `recovery_failure_count` counts failures to schedule or complete deferred bus-off recovery. All are cheap counters you can poll from a low-rate monitoring task.
+## Light-board freshness behavior
 
-`can_driver_receive()` consumes a queued frame and returns `ESP_ERR_INVALID_SIZE` if the explicit destination capacity is too small. It reports the required length in `frame->buffer_len` and performs no partial copy.
+The rear light-board example maintains independent freshness state:
 
-### 5. Testing in Loopback (no transceiver needed)
+```text
+AUX_COMMAND freshness
+    └── turn signals, headlights, hazards, horn, wipers
 
-```c
-CanInitFlags_t flags = { .loopback = 1, .listen_only = 0 };
-// Loopback is classic-CAN loopback; the driver enables self-test mode when
-// .loopback is set. CAN-FD loopback is not supported.
-can_driver_init(GPIO_NUM_4, GPIO_NUM_5, 500000, flags, NULL);
+PEDAL_STATUS freshness
+    └── brake_active
 ```
 
-In loopback mode, every frame you transmit is also received by the same node — a quick way to verify the driver and the DBC pack/unpack round-trip on the bench. A receiving task (see section 2) will see the frame you sent in section 3.
+Loss of the auxiliary command produces the safe auxiliary state. Loss of the
+pedal-status message makes brake state invalid and selects the local
+brake-inactive fail-safe. One message never refreshes the other.
 
-## Power Notes
+## Regenerating the protocol bindings
 
-- The acceptance filter is the main power lever: only matching frames generate an interrupt, so the CPU stays asleep between relevant frames even on a busy bus.
-- RX is interrupt-driven (no polling task in the driver), and the driver spawns no background tasks.
-- While the node is enabled it holds a PM lock (APB frequency / light-sleep constraint on some targets). Call `can_driver_deinit()` before entering light sleep to release it, then `can_driver_init()` again to resume; the transceiver standby pin (e.g. STB) can be driven alongside this for further savings.
-- Stop and join all tasks using the driver before calling `can_driver_deinit()`. Init/deinit must be externally serialized with transmit, receive, and status calls; the driver rejects teardown while an operation is active.
-
-```c
-// Before entering light sleep
-can_driver_deinit();
-gpio_set_level(STB_GPIO, 1);  // put the transceiver in standby
-
-// ... sleep ...
-
-// On wake
-gpio_set_level(STB_GPIO, 0);
-can_driver_init(GPIO_NUM_4, GPIO_NUM_5, 500000, flags, &filter);
-```
-
-## CAN ID Convention (mask-friendly)
-
-The driver is ID-agnostic, but a hardware mask can only express "these bit positions are fixed, the rest are free". To keep filtering exact, allocate IDs as fixed bit fields with power-of-two-aligned widths. The `network.dbc` in this repo follows this convention:
-
-| Bits | Field | Meaning |
-|------|-------|---------|
-| 10..8 | Class | 0x0 reserved · 0x1 pedal/safety · 0x2 aux · 0x3 power · 0x4 dashboard · 0x5..0x7 future |
-| 7..0  | Message index | 256 per class, allocate contiguously |
-
-Rules for adding IDs:
-- New messages stay in their sender's class with the next free index (e.g. a new power frame → `0x313`).
-- A new domain gets the next unused class (never reuse one).
-- Class 0x0 stays reserved so no live traffic collides with filter-region spill.
-
-Why this works:
-- **Receive a whole class** → exact mask `code = C<<8`, `mask = 0x700`, regardless of how many messages are added later.
-- **Receive one message** → exact mask with that single ID.
-- **Receive across classes** (e.g. pedal + power) → not expressible with one hardware filter; use `.software_filter` (or accept-all + your own dispatch).
-
-## Modifying the DBC
-
-If you modify `network.dbc` to define new network messages, you must regenerate the C parser code. You can do this by using the Python `cantools` package:
+Install the pinned generator and write output to a temporary directory:
 
 ```bash
-cantools generate_c_source network.dbc
+python -m pip install cantools==41.4.3
+python -m cantools generate_c_source network.dbc -o /tmp/generated
 ```
 
-This updates `network.c` and `network.h` with your new frames and signals. Since this repo keeps `network.h` in `include/`, generate into a temp directory and copy the files over (as `include/network.h` and `network.c`), or adapt the command. The checked-in files are generated with cantools 41.4.3.
+Copy the generated `network.c` to the repository root and
+`network.h` to `include/network.h`. Do not hand-edit generated files.
 
-## GitHub Actions / CI
+Run the repository checks:
 
-Two GitHub Actions are provided:
-- **`ci.yml`**: builds both examples (`dbc_usage`, `light_board`) for the `esp32c3` target on every push/PR — a compile gate for the driver and example code.
-- **`publish.yml`**: builds the examples for `esp32c3` and publishes the component to the ESP Component Registry when a `v*.*.*` tag is pushed.
+```bash
+python tools/check_network_artifacts.py
+python tools/check_active_references.py
+```
 
-The examples target ESP32-C3 (CAN TX = GPIO 4, RX = GPIO 5, plus the light_board wiring). If you intend to use this on other chips (like ESP32-S3 or ESP32), modify the pins in your application to match your hardware layout.
+The artifact check validates the DBC contract and detects drift in both
+generated files. Cantools embeds a generation timestamp, so only that
+timestamp is normalized during comparison.
+
+## CI and release
+
+CI validates the DBC, generated artifacts, codec tests, and both ESP-IDF
+examples for ESP32-C3 under ESP-IDF 5.5.3.
+
+The v5.0.0 release is represented by:
+
+- Git tag: `v5.0.0`
+- ESP Component Registry version: `5.0.0`
+- GitHub release: `v5.0.0`
+- Release notes describing the CAN V5 breaking migration
+
+The component manifest intentionally does not maintain a separate checked-in
+component version. The publishing workflow derives the Registry version from
+the Git tag.
